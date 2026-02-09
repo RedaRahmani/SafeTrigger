@@ -106,5 +106,17 @@ jobs:
           echo "$HOME/.local/share/solana/install/active_release/bin" >> $GITHUB_PATH
       - name: Install Anchor CLI
         run: cargo install --git https://github.com/coral-xyz/anchor --tag v${{ env.ANCHOR_VERSION }} anchor-cli --locked
-      - run: yarn install
+      - run: yarn install --frozen-lockfile
       - run: anchor test
+
+  ts-sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: yarn install --frozen-lockfile
+      - run: yarn workspace @catalyst-guard/sdk build
+      - run: yarn workspace @catalyst-guard/sdk test --passWithNoTests
