@@ -6,6 +6,7 @@ description = "CatalystGuard Keeper Service – monitors tickets and executes th
 license = "BUSL-1.1"
 
 [dependencies]
+borsh = "0.10.4"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

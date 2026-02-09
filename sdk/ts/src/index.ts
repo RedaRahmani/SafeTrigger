@@ -24,25 +24,24 @@ export const TICKET_SEED = Buffer.from("ticket");
 /** Domain separator for commitment preimage (must match on-chain constant). */
 export const COMMITMENT_DOMAIN = Buffer.from("CSv0.2");
 
-// ── Enums (must match Borsh order in Rust) ──────────────────────
+// ── Enums (strip-only compatible) ───────────────────────────────
+//
+// Node's "strip-only" TypeScript loader does not support `enum` syntax.
+// Use const objects so SDK code can run in Node without transpilation.
 
 /** Trigger direction – matches on-chain TriggerDirection enum. */
-export enum TriggerDirection {
-  Above = 0,
-  Below = 1,
-}
+export const TriggerDirection = { Above: 0, Below: 1 } as const;
+export type TriggerDirection =
+  (typeof TriggerDirection)[keyof typeof TriggerDirection];
 
 /** Position direction – matches drift_cpi::PositionDirection enum. */
-export enum PositionDirection {
-  Long = 0,
-  Short = 1,
-}
+export const PositionDirection = { Long: 0, Short: 1 } as const;
+export type PositionDirection =
+  (typeof PositionDirection)[keyof typeof PositionDirection];
 
 /** Order type – matches drift_cpi::OrderType enum. */
-export enum OrderType {
-  Market = 0,
-  Limit = 1,
-}
+export const OrderType = { Market: 0, Limit: 1 } as const;
+export type OrderType = (typeof OrderType)[keyof typeof OrderType];
 
 // ── HedgePayloadV1 ─────────────────────────────────────────────
 

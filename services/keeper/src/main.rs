@@ -19,6 +19,7 @@
 //! ```
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use borsh::BorshDeserialize;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
@@ -80,28 +81,28 @@ impl Default for KeeperConfig {
 
 // ── HedgePayloadV1 ─────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TriggerDirection {
     Above = 0,
     Below = 1,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum PositionDirection {
     Long = 0,
     Short = 1,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(BorshDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum OrderType {
     Market = 0,
     Limit = 1,
 }
 
-#[derive(Debug, Clone)]
+#[derive(BorshDeserialize, Debug, Clone, PartialEq)]
 pub struct HedgePayloadV1 {
     pub market_index: u16,
     pub trigger_direction: TriggerDirection,
@@ -119,73 +120,7 @@ pub struct HedgePayloadV1 {
 
 impl HedgePayloadV1 {
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
-        let mut o = 0;
-        fn r(d: &[u8], o: usize, n: usize) -> Result<&[u8], String> {
-            d.get(o..o + n).ok_or_else(|| "truncated".to_string())
-        }
-
-        let market_index = u16::from_le_bytes(r(data, o, 2)?.try_into().unwrap());
-        o += 2;
-        let trigger_direction = match *data.get(o).ok_or("truncated")? {
-            0 => TriggerDirection::Above,
-            1 => TriggerDirection::Below,
-            v => return Err(format!("bad trigger_direction: {v}")),
-        };
-        o += 1;
-        let trigger_price = u64::from_le_bytes(r(data, o, 8)?.try_into().unwrap());
-        o += 8;
-        let side = match *data.get(o).ok_or("truncated")? {
-            0 => PositionDirection::Long,
-            1 => PositionDirection::Short,
-            v => return Err(format!("bad side: {v}")),
-        };
-        o += 1;
-        let base_amount = u64::from_le_bytes(r(data, o, 8)?.try_into().unwrap());
-        o += 8;
-        let reduce_only = *data.get(o).ok_or("truncated")? != 0;
-        o += 1;
-        let order_type = match *data.get(o).ok_or("truncated")? {
-            0 => OrderType::Market,
-            1 => OrderType::Limit,
-            v => return Err(format!("bad order_type: {v}")),
-        };
-        o += 1;
-        let limit_price = match *data.get(o).ok_or("truncated")? {
-            0 => {
-                o += 1;
-                None
-            }
-            1 => {
-                o += 1;
-                let p = u64::from_le_bytes(r(data, o, 8)?.try_into().unwrap());
-                o += 8;
-                Some(p)
-            }
-            v => return Err(format!("bad Option tag: {v}")),
-        };
-        let max_slippage_bps = u16::from_le_bytes(r(data, o, 2)?.try_into().unwrap());
-        o += 2;
-        let deadline_ts = i64::from_le_bytes(r(data, o, 8)?.try_into().unwrap());
-        o += 8;
-
-        let oracle_program: [u8; 32] = r(data, o, 32)?.try_into().unwrap();
-        o += 32;
-        let oracle: [u8; 32] = r(data, o, 32)?.try_into().unwrap();
-
-        Ok(Self {
-            market_index,
-            trigger_direction,
-            trigger_price,
-            side,
-            base_amount,
-            reduce_only,
-            order_type,
-            limit_price,
-            max_slippage_bps,
-            deadline_ts,
-            oracle_program,
-            oracle,
-        })
+        Self::try_from_slice(data).map_err(|_| "invalid borsh".to_string())
     }
 
     pub fn is_trigger_met(&self, oracle_price: u64) -> bool {

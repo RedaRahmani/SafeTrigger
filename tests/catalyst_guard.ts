@@ -6,12 +6,18 @@ import { expect } from "chai";
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import path from "path";
+import {
+  POLICY_SEED,
+  TICKET_SEED,
+  serializeHedgePayload,
+  createCommitment as sdkCreateCommitment,
+  TriggerDirection,
+  PositionDirection,
+  OrderType,
+} from "../sdk/ts/src/index.ts";
+import type { HedgePayloadV1 } from "../sdk/ts/src/index.ts";
 
 // ── Constants ───────────────────────────────────────────────────
-
-const POLICY_SEED = Buffer.from("policy");
-const TICKET_SEED = Buffer.from("ticket");
-const COMMITMENT_DOMAIN = Buffer.from("CSv0.2");
 
 // Drift (pinned program id + PDA seeds)
 const DRIFT_PROGRAM_ID = new PublicKey(
@@ -70,80 +76,15 @@ function findDriftPerpMarketPDA(marketIndex: number): [PublicKey, number] {
   );
 }
 
-// ── Enums as plain constants (TS enums not supported in strip-only mode) ──
-
-const TriggerDirection = { Above: 0, Below: 1 } as const;
-type TriggerDirection = (typeof TriggerDirection)[keyof typeof TriggerDirection];
-
-const PositionDirection = { Long: 0, Short: 1 } as const;
-type PositionDirection =
-  (typeof PositionDirection)[keyof typeof PositionDirection];
-
-const OrderType = { Market: 0, Limit: 1 } as const;
-type OrderType = (typeof OrderType)[keyof typeof OrderType];
-
 // Set during oracle initialization test; used by defaultPayload().
 let oracleProgramId: PublicKey;
 let oracleFeedPubkey: PublicKey;
 
 // ── HedgePayloadV1 helpers ──────────────────────────────────────
 
-interface HedgePayloadV1 {
-  marketIndex: number;
-  triggerDirection: TriggerDirection;
-  triggerPrice: bigint;
-  side: PositionDirection;
-  baseAmount: bigint;
-  reduceOnly: boolean;
-  orderType: OrderType;
-  limitPrice: bigint | null;
-  maxSlippageBps: number;
-  deadlineTs: bigint;
-  oracleProgram: PublicKey;
-  oracle: PublicKey;
-}
-
-/**
- * Borsh-serialize HedgePayloadV1 — must match Rust struct field order.
- */
+/** Canonical serializer: SDK implementation (single source of truth). */
 function serializePayload(p: HedgePayloadV1): Buffer {
-  const hasLimit = p.limitPrice !== null && p.limitPrice !== undefined;
-  const size =
-    2 +
-    1 +
-    8 +
-    1 +
-    8 +
-    1 +
-    1 +
-    1 +
-    (hasLimit ? 8 : 0) +
-    2 +
-    8 +
-    32 +
-    32;
-  const buf = Buffer.alloc(size);
-  let offset = 0;
-
-  buf.writeUInt16LE(p.marketIndex, offset); offset += 2;
-  buf.writeUInt8(p.triggerDirection, offset); offset += 1;
-  buf.writeBigUInt64LE(BigInt(p.triggerPrice), offset); offset += 8;
-  buf.writeUInt8(p.side, offset); offset += 1;
-  buf.writeBigUInt64LE(BigInt(p.baseAmount), offset); offset += 8;
-  buf.writeUInt8(p.reduceOnly ? 1 : 0, offset); offset += 1;
-  buf.writeUInt8(p.orderType, offset); offset += 1;
-  if (hasLimit) {
-    buf.writeUInt8(1, offset); offset += 1;
-    buf.writeBigUInt64LE(BigInt(p.limitPrice!), offset); offset += 8;
-  } else {
-    buf.writeUInt8(0, offset); offset += 1;
-  }
-  buf.writeUInt16LE(p.maxSlippageBps, offset); offset += 2;
-  buf.writeBigInt64LE(BigInt(p.deadlineTs), offset); offset += 8;
-  buf.set(p.oracleProgram.toBuffer(), offset); offset += 32;
-  buf.set(p.oracle.toBuffer(), offset); offset += 32;
-
-  return buf;
+  return serializeHedgePayload(p);
 }
 
 /** Build a valid default payload for tests. Policy must allow these values. */
@@ -201,14 +142,9 @@ function createCommitment(
   secretSalt: Buffer,
   revealData: Buffer
 ): Buffer {
-  const hasher = createHash("sha256");
-  hasher.update(COMMITMENT_DOMAIN);
-  hasher.update(owner.toBuffer());
-  hasher.update(policy.toBuffer());
-  hasher.update(ticketId);
-  hasher.update(secretSalt);
-  hasher.update(revealData);
-  return hasher.digest();
+  return Buffer.from(
+    sdkCreateCommitment(owner, policy, ticketId, secretSalt, revealData)
+  );
 }
 
 // ── Tests ───────────────────────────────────────────────────────
@@ -240,7 +176,10 @@ describe("catalyst_guard", () => {
   describe("Policy Management", () => {
     it("initializes test oracle feed", async () => {
       oracleProgramId = oracleProgram.programId;
-      oracleFeed = Keypair.generate();
+      // Deterministic so known-answer vectors can bind to a stable oracle pubkey.
+      oracleFeed = Keypair.fromSeed(
+        Uint8Array.from(Array.from({ length: 32 }, (_, i) => i + 100))
+      );
       oracleFeedPubkey = oracleFeed.publicKey;
 
       const slot = await provider.connection.getSlot();
@@ -465,6 +404,179 @@ describe("catalyst_guard", () => {
       } catch (err: any) {
         expect(err.toString()).to.contain("TooManyMarkets");
       }
+    });
+  });
+
+  // ── Known-answer vectors (KAT) ───────────────────────────────
+
+  describe("Known-answer vectors (KAT)", () => {
+    // Deterministic keypairs so the derived PDAs and expected commitment are stable.
+    const katAuthority = Keypair.fromSeed(
+      Uint8Array.from(Array.from({ length: 32 }, (_, i) => i))
+    );
+
+    const katTicketId = Buffer.from(
+      "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "hex"
+    );
+    const katSecretSalt = Buffer.from(
+      "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+      "hex"
+    );
+
+    // Computed offline from the fixed vector:
+    // sha256("CSv0.2" || owner || policy || ticket_id || secret_salt || revealed_payload)
+    const expectedCommitmentHex =
+      "71b6d2505ca5649a2e3f7faea7cec06c04f86822102983c8d342ff51558fb9a8";
+
+    let katPolicyPDA: PublicKey;
+    let katDriftUserPDA: PublicKey;
+    let katDriftUserStatsPDA: PublicKey;
+    let katTicketPDA: PublicKey;
+
+    before(async () => {
+      const airdropSig = await provider.connection.requestAirdrop(
+        katAuthority.publicKey,
+        5_000_000_000
+      );
+      await provider.connection.confirmTransaction(airdropSig);
+
+      [katDriftUserPDA] = findDriftUserPDA(
+        katAuthority.publicKey,
+        DRIFT_SUB_ACCOUNT_ID
+      );
+      [katDriftUserStatsPDA] = findDriftUserStatsPDA(katAuthority.publicKey);
+
+      await driftStub.methods
+        .initUser(DRIFT_SUB_ACCOUNT_ID)
+        .accounts({
+          user: katDriftUserPDA,
+          authority: katAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([katAuthority])
+        .rpc();
+
+      await driftStub.methods
+        .initUserStats()
+        .accounts({
+          userStats: katDriftUserStatsPDA,
+          authority: katAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([katAuthority])
+        .rpc();
+
+      [katPolicyPDA] = findPolicyPDA(
+        program.programId,
+        katAuthority.publicKey,
+        katDriftUserPDA
+      );
+
+      await program.methods
+        .initPolicy(
+          [0],
+          new anchor.BN(1_000_000_000),
+          100,
+          new anchor.BN(10),
+          new anchor.BN(60),
+          0,
+          true
+        )
+        .accounts({
+          policy: katPolicyPDA,
+          authority: katAuthority.publicKey,
+          driftSubAccount: katDriftUserPDA,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([katAuthority])
+        .rpc();
+
+      await driftStub.methods
+        .updateUserDelegate(katPolicyPDA)
+        .accounts({
+          user: katDriftUserPDA,
+          authority: katAuthority.publicKey,
+        })
+        .signers([katAuthority])
+        .rpc();
+
+      [katTicketPDA] = findTicketPDA(program.programId, katPolicyPDA, katTicketId);
+    });
+
+    it("KAT: commitment matches expected bytes and verifies on-chain in execute_ticket", async () => {
+      const payload: HedgePayloadV1 = {
+        marketIndex: 0,
+        triggerDirection: TriggerDirection.Above,
+        triggerPrice: BigInt(150_000_000),
+        side: PositionDirection.Long,
+        baseAmount: BigInt(1_000_000_000),
+        reduceOnly: true,
+        orderType: OrderType.Market,
+        limitPrice: null,
+        maxSlippageBps: 50,
+        // Far future so test won't break due to wall-clock time.
+        deadlineTs: BigInt(4_102_444_800),
+        oracleProgram: oracleProgram.programId,
+        oracle: oracleFeed.publicKey,
+      };
+
+      const revealData = serializePayload(payload);
+      const commitment = createCommitment(
+        katAuthority.publicKey,
+        katPolicyPDA,
+        katTicketId,
+        katSecretSalt,
+        revealData
+      );
+      expect(commitment.toString("hex")).to.equal(expectedCommitmentHex);
+
+      const now = Math.floor(Date.now() / 1000);
+      await program.methods
+        .createTicket(
+          Array.from(commitment) as any,
+          Array.from(katTicketId) as any,
+          new anchor.BN(now + 3600)
+        )
+        .accounts({
+          ticket: katTicketPDA,
+          policy: katPolicyPDA,
+          owner: katAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([katAuthority])
+        .rpc();
+
+      // Fresh oracle + predicate satisfied.
+      const slot = await provider.connection.getSlot();
+      await oracleProgram.methods
+        .setFeed(new anchor.BN(160_000_000), new anchor.BN(slot))
+        .accounts({
+          feed: oracleFeed.publicKey,
+          authority: authority.publicKey,
+        })
+        .rpc();
+
+      const tx = await program.methods
+        .executeTicket(Array.from(katSecretSalt) as any, revealData)
+        .accounts({
+          ticket: katTicketPDA,
+          policy: katPolicyPDA,
+          keeper: katAuthority.publicKey,
+          oracle: oracleFeed.publicKey,
+          driftProgram: DRIFT_PROGRAM_ID,
+          driftState: driftStatePDA,
+          driftUser: katDriftUserPDA,
+          driftUserStats: katDriftUserStatsPDA,
+          driftSpotMarket: driftSpotMarketPDA,
+          driftPerpMarket: driftPerpMarket0PDA,
+        })
+        .signers([katAuthority])
+        .rpc();
+      expect(tx).to.exist;
+
+      const ticketAccount = await program.account.ticket.fetch(katTicketPDA);
+      expect(ticketAccount.status).to.deep.equal({ executed: {} });
     });
   });
 
