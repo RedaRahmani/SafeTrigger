@@ -2,6 +2,7 @@
 members = [
     "programs/catalyst_guard",
     "crates/drift_cpi",
+    "services/keeper",
 ]
 resolver = "2"
 
