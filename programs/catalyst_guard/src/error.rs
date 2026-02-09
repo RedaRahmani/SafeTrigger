@@ -74,6 +74,9 @@ pub enum CatalystError {
     #[msg("Oracle price is stale")]
     OracleStale,
 
+    #[msg("Invalid oracle account")]
+    InvalidOracleAccount,
+
     #[msg("Rate limit exceeded for this policy window")]
     RateLimitExceeded,
 

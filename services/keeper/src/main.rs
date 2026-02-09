@@ -113,6 +113,8 @@ pub struct HedgePayloadV1 {
     pub limit_price: Option<u64>,
     pub max_slippage_bps: u16,
     pub deadline_ts: i64,
+    pub oracle_program: [u8; 32],
+    pub oracle: [u8; 32],
 }
 
 impl HedgePayloadV1 {
@@ -164,6 +166,11 @@ impl HedgePayloadV1 {
         let max_slippage_bps = u16::from_le_bytes(r(data, o, 2)?.try_into().unwrap());
         o += 2;
         let deadline_ts = i64::from_le_bytes(r(data, o, 8)?.try_into().unwrap());
+        o += 8;
+
+        let oracle_program: [u8; 32] = r(data, o, 32)?.try_into().unwrap();
+        o += 32;
+        let oracle: [u8; 32] = r(data, o, 32)?.try_into().unwrap();
 
         Ok(Self {
             market_index,
@@ -176,6 +183,8 @@ impl HedgePayloadV1 {
             limit_price,
             max_slippage_bps,
             deadline_ts,
+            oracle_program,
+            oracle,
         })
     }
 
@@ -447,6 +456,8 @@ mod tests {
         buf.push(0); // None
         buf.extend_from_slice(&50u16.to_le_bytes());
         buf.extend_from_slice(&2_000_000_000i64.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 32]); // oracle_program
+        buf.extend_from_slice(&[0u8; 32]); // oracle
 
         let p = HedgePayloadV1::from_bytes(&buf).unwrap();
         assert_eq!(p.market_index, 0);
@@ -470,6 +481,8 @@ mod tests {
         buf.push(0);
         buf.extend_from_slice(&50u16.to_le_bytes());
         buf.extend_from_slice(&2_000_000_000i64.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 32]);
+        buf.extend_from_slice(&[0u8; 32]);
 
         let p = HedgePayloadV1::from_bytes(&buf).unwrap();
         assert!(!p.is_trigger_met(149_999_999));

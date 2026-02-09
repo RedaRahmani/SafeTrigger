@@ -57,6 +57,14 @@ pub struct HedgePayloadV1 {
     /// Unix timestamp deadline — ticket must execute before this.
     /// Provides a secondary time-bound independent of ticket expiry.
     pub deadline_ts: i64,
+
+    /// Oracle program ID that owns the oracle price feed account.
+    /// This is commitment-bound so an executor cannot swap oracle programs.
+    pub oracle_program: Pubkey,
+
+    /// Oracle price feed account pubkey.
+    /// This is commitment-bound so an executor cannot swap oracle accounts.
+    pub oracle: Pubkey,
 }
 
 impl HedgePayloadV1 {
@@ -134,6 +142,8 @@ mod tests {
             limit_price: None,
             max_slippage_bps: 50,
             deadline_ts: 2_000_000_000,
+            oracle_program: Pubkey::default(),
+            oracle: Pubkey::default(),
         }
     }
 

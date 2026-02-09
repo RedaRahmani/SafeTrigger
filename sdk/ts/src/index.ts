@@ -57,17 +57,20 @@ export interface HedgePayloadV1 {
   limitPrice: bigint | null; // Option<u64>
   maxSlippageBps: number; // u16
   deadlineTs: bigint; // i64
+  oracleProgram: PublicKey; // Pubkey
+  oracle: PublicKey; // Pubkey
 }
 
 /**
  * Borsh-serialize a HedgePayloadV1 to bytes.
  * Layout must exactly match the Rust struct field order and Borsh encoding:
- *   u16 + enum(u8) + u64 + enum(u8) + u64 + bool(u8) + enum(u8) + Option<u64> + u16 + i64
+ *   u16 + enum(u8) + u64 + enum(u8) + u64 + bool(u8) + enum(u8) + Option<u64> + u16 + i64 + Pubkey + Pubkey
  */
 export function serializeHedgePayload(p: HedgePayloadV1): Buffer {
-  // Calculate size: 2 + 1 + 8 + 1 + 8 + 1 + 1 + (1 + optional 8) + 2 + 8
+  // Calculate size: 2 + 1 + 8 + 1 + 8 + 1 + 1 + (1 + optional 8) + 2 + 8 + 32 + 32
   const hasLimit = p.limitPrice !== null && p.limitPrice !== undefined;
-  const size = 2 + 1 + 8 + 1 + 8 + 1 + 1 + 1 + (hasLimit ? 8 : 0) + 2 + 8;
+  const size =
+    2 + 1 + 8 + 1 + 8 + 1 + 1 + 1 + (hasLimit ? 8 : 0) + 2 + 8 + 32 + 32;
   const buf = Buffer.alloc(size);
   let offset = 0;
 
@@ -117,6 +120,14 @@ export function serializeHedgePayload(p: HedgePayloadV1): Buffer {
   // deadline_ts: i64 LE
   buf.writeBigInt64LE(BigInt(p.deadlineTs), offset);
   offset += 8;
+
+  // oracle_program: Pubkey (32 bytes)
+  buf.set(p.oracleProgram.toBytes(), offset);
+  offset += 32;
+
+  // oracle: Pubkey (32 bytes)
+  buf.set(p.oracle.toBytes(), offset);
+  offset += 32;
 
   return buf;
 }

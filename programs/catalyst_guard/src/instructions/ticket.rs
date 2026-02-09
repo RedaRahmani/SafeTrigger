@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::CatalystError;
 use crate::events::{TicketCancelled, TicketCreated, TicketExpired};
+use crate::state::oracle::PriceFeed;
 use crate::state::payload::HedgePayloadV1;
 use crate::state::policy::{Policy, POLICY_SEED};
 use crate::state::ticket::*;
@@ -186,6 +187,10 @@ pub struct ExecuteTicket<'info> {
 
     /// The keeper executing the ticket. Permissionless (anyone may execute).
     pub keeper: Signer<'info>,
+
+    /// CHECK: Oracle price feed account. Bound to the commitment via the
+    /// revealed payload, and validated in the handler.
+    pub oracle: UncheckedAccount<'info>,
 }
 
 pub fn handle_execute_ticket(
@@ -239,6 +244,35 @@ pub fn handle_execute_ticket(
             .ok_or(CatalystError::MathOverflow)?;
         require!(elapsed >= min_interval, CatalystError::RateLimitExceeded);
     }
+
+    // ── M1: Oracle freshness + predicate gating ─────────────────
+    // The oracle program/account are commitment-bound via the revealed payload,
+    // preventing executors from swapping in a different price feed.
+    require!(
+        payload.oracle == ctx.accounts.oracle.key(),
+        CatalystError::InvalidOracleAccount
+    );
+    require!(
+        payload.oracle_program == *ctx.accounts.oracle.to_account_info().owner,
+        CatalystError::InvalidOracleAccount
+    );
+
+    let mut oracle_data: &[u8] = &ctx.accounts.oracle.try_borrow_data()?;
+    let feed = PriceFeed::try_deserialize(&mut oracle_data)
+        .map_err(|_| CatalystError::InvalidOracleAccount)?;
+
+    require!(policy.min_time_window > 0, CatalystError::InvalidTimeWindow);
+    let max_staleness_slots = policy.min_time_window as u64;
+    let age_slots = clock
+        .slot
+        .checked_sub(feed.last_updated_slot)
+        .ok_or(CatalystError::InvalidOracleAccount)?;
+    require!(age_slots <= max_staleness_slots, CatalystError::OracleStale);
+
+    require!(
+        payload.is_trigger_met(feed.price),
+        CatalystError::PredicateNotMet
+    );
 
     // ── P4: Drift CPI firewall ────────────────────────────────────
     // Build BoundedOrderParams from the validated payload.

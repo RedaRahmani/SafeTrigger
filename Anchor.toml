@@ -7,6 +7,7 @@ skip-lint = false
 
 [programs.localnet]
 catalyst_guard = "2oUmUDgTvVFBDqNC2TpVLhtvaenKgiNnuvsPMUYT4yJq"
+test_oracle = "2ys3Ma4PQeQTXPp7wDzhUw6dbgFLmdDWuAWXBmeourqn"
 
 [registry]
 url = "https://api.apr.dev"

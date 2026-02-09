@@ -1,6 +1,7 @@
 import * as anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
 import { CatalystGuard } from "../target/types/catalyst_guard";
+import { TestOracle } from "../target/types/test_oracle";
 import { Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
 import { createHash, randomBytes } from "crypto";
 import { expect } from "chai";
@@ -23,6 +24,10 @@ type PositionDirection =
 const OrderType = { Market: 0, Limit: 1 } as const;
 type OrderType = (typeof OrderType)[keyof typeof OrderType];
 
+// Set during oracle initialization test; used by defaultPayload().
+let oracleProgramId: PublicKey;
+let oracleFeedPubkey: PublicKey;
+
 // ── HedgePayloadV1 helpers ──────────────────────────────────────
 
 interface HedgePayloadV1 {
@@ -36,6 +41,8 @@ interface HedgePayloadV1 {
   limitPrice: bigint | null;
   maxSlippageBps: number;
   deadlineTs: bigint;
+  oracleProgram: PublicKey;
+  oracle: PublicKey;
 }
 
 /**
@@ -43,7 +50,20 @@ interface HedgePayloadV1 {
  */
 function serializePayload(p: HedgePayloadV1): Buffer {
   const hasLimit = p.limitPrice !== null && p.limitPrice !== undefined;
-  const size = 2 + 1 + 8 + 1 + 8 + 1 + 1 + 1 + (hasLimit ? 8 : 0) + 2 + 8;
+  const size =
+    2 +
+    1 +
+    8 +
+    1 +
+    8 +
+    1 +
+    1 +
+    1 +
+    (hasLimit ? 8 : 0) +
+    2 +
+    8 +
+    32 +
+    32;
   const buf = Buffer.alloc(size);
   let offset = 0;
 
@@ -62,6 +82,8 @@ function serializePayload(p: HedgePayloadV1): Buffer {
   }
   buf.writeUInt16LE(p.maxSlippageBps, offset); offset += 2;
   buf.writeBigInt64LE(BigInt(p.deadlineTs), offset); offset += 8;
+  buf.set(p.oracleProgram.toBuffer(), offset); offset += 32;
+  buf.set(p.oracle.toBuffer(), offset); offset += 32;
 
   return buf;
 }
@@ -69,6 +91,9 @@ function serializePayload(p: HedgePayloadV1): Buffer {
 /** Build a valid default payload for tests. Policy must allow these values. */
 function defaultPayload(): HedgePayloadV1 {
   const now = Math.floor(Date.now() / 1000);
+  if (!oracleProgramId || !oracleFeedPubkey) {
+    throw new Error("oracle not initialized");
+  }
   return {
     marketIndex: 0,
     triggerDirection: TriggerDirection.Above,
@@ -80,6 +105,8 @@ function defaultPayload(): HedgePayloadV1 {
     limitPrice: null,
     maxSlippageBps: 50,
     deadlineTs: BigInt(now + 7200),
+    oracleProgram: oracleProgramId,
+    oracle: oracleFeedPubkey,
   };
 }
 
@@ -133,8 +160,11 @@ describe("catalyst_guard", () => {
   anchor.setProvider(provider);
 
   const program = anchor.workspace.catalystGuard as Program<CatalystGuard>;
+  const oracleProgram = anchor.workspace.testOracle as Program<TestOracle>;
   const authority = provider.wallet;
   const driftSubAccount = Keypair.generate();
+
+  let oracleFeed: Keypair;
 
   let policyPDA: PublicKey;
   let policyBump: number;
@@ -142,11 +172,31 @@ describe("catalyst_guard", () => {
   // ── Policy Tests ────────────────────────────────────────────
 
   describe("Policy Management", () => {
+    it("initializes test oracle feed", async () => {
+      oracleProgramId = oracleProgram.programId;
+      oracleFeed = Keypair.generate();
+      oracleFeedPubkey = oracleFeed.publicKey;
+
+      const slot = await provider.connection.getSlot();
+
+      const tx = await oracleProgram.methods
+        .initFeed(new anchor.BN(160_000_000), new anchor.BN(slot))
+        .accounts({
+          feed: oracleFeed.publicKey,
+          authority: authority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([oracleFeed])
+        .rpc();
+
+      console.log("  initFeed tx:", tx);
+    });
+
     it("initializes a policy", async () => {
       const allowedMarkets = [0, 1, 5];
       const maxBaseAmount = new anchor.BN(1_000_000_000);
       const oracleDeviationBps = 100;
-      const minTimeWindow = new anchor.BN(60);
+      const minTimeWindow = new anchor.BN(10); // also used as max oracle staleness (slots)
       const maxTimeWindow = new anchor.BN(3600);
       const rateLimitPerWindow = 0; // disabled for general tests; tested separately
       const reduceOnly = false;
@@ -371,6 +421,15 @@ describe("catalyst_guard", () => {
     });
 
     it("atomicity: valid reveal does not consume ticket when Drift CPI is unavailable", async () => {
+      const slot = await provider.connection.getSlot();
+      await oracleProgram.methods
+        .setFeed(new anchor.BN(160_000_000), new anchor.BN(slot))
+        .accounts({
+          feed: oracleFeed.publicKey,
+          authority: authority.publicKey,
+        })
+        .rpc();
+
       try {
         await program.methods
           .executeTicket(Array.from(secretSalt) as any, revealData)
@@ -378,6 +437,7 @@ describe("catalyst_guard", () => {
             ticket: ticketPDA,
             policy: policyPDA,
             keeper: authority.publicKey,
+            oracle: oracleFeed.publicKey,
           })
           .rpc();
         expect.fail("Should have thrown – Drift CPI unavailable");
@@ -394,6 +454,15 @@ describe("catalyst_guard", () => {
     });
 
     it("atomicity: repeated execute attempts still fail and ticket remains Open", async () => {
+      const slot = await provider.connection.getSlot();
+      await oracleProgram.methods
+        .setFeed(new anchor.BN(160_000_000), new anchor.BN(slot))
+        .accounts({
+          feed: oracleFeed.publicKey,
+          authority: authority.publicKey,
+        })
+        .rpc();
+
       try {
         await program.methods
           .executeTicket(Array.from(secretSalt) as any, revealData)
@@ -401,6 +470,7 @@ describe("catalyst_guard", () => {
             ticket: ticketPDA,
             policy: policyPDA,
             keeper: authority.publicKey,
+            oracle: oracleFeed.publicKey,
           })
           .rpc();
         expect.fail("Should have thrown – Drift CPI unavailable");
@@ -454,6 +524,7 @@ describe("catalyst_guard", () => {
             ticket: ticketPDA2,
             policy: policyPDA,
             keeper: authority.publicKey,
+            oracle: oracleFeed.publicKey,
           })
           .rpc();
         expect.fail("Should have thrown – commitment mismatch");
@@ -631,6 +702,7 @@ describe("catalyst_guard", () => {
             ticket: ticketBypassPDA,
             policy: policyBPDA,
             keeper: authority.publicKey,
+            oracle: oracleFeed.publicKey,
           })
           .rpc();
         expect.fail("Should have thrown – policy mismatch");
@@ -708,6 +780,7 @@ describe("catalyst_guard", () => {
             ticket: commitTicketPDA,
             policy: policyPDA,
             keeper: authority.publicKey,
+            oracle: oracleFeed.publicKey,
           })
           .rpc();
         expect.fail("Should have thrown – wrong salt");
@@ -717,6 +790,15 @@ describe("catalyst_guard", () => {
     });
 
     it("atomicity: correct salt + reveal validates but still fails without Drift CPI", async () => {
+      const slot = await provider.connection.getSlot();
+      await oracleProgram.methods
+        .setFeed(new anchor.BN(160_000_000), new anchor.BN(slot))
+        .accounts({
+          feed: oracleFeed.publicKey,
+          authority: authority.publicKey,
+        })
+        .rpc();
+
       try {
         await program.methods
           .executeTicket(
@@ -727,6 +809,7 @@ describe("catalyst_guard", () => {
             ticket: commitTicketPDA,
             policy: policyPDA,
             keeper: authority.publicKey,
+            oracle: oracleFeed.publicKey,
           })
           .rpc();
         expect.fail("Should have thrown – Drift CPI unavailable");
@@ -776,15 +859,137 @@ describe("catalyst_guard", () => {
         })
         .rpc();
 
+      // Ensure oracle is fresh and predicate is satisfied for validation tests.
+      const slot = await provider.connection.getSlot();
+      await oracleProgram.methods
+        .setFeed(new anchor.BN(160_000_000), new anchor.BN(slot))
+        .accounts({
+          feed: oracleFeed.publicKey,
+          authority: authority.publicKey,
+        })
+        .rpc();
+
       return program.methods
         .executeTicket(Array.from(secretSalt) as any, revealData)
         .accounts({
           ticket: ticketPDA,
           policy: policyPDA,
           keeper: authority.publicKey,
+          oracle: oracleFeed.publicKey,
         })
         .rpc();
     }
+
+    it("rejects execute_ticket when predicate not met (PredicateNotMet)", async () => {
+      const payload = defaultPayload();
+      payload.triggerPrice = BigInt(200_000_000); // oracle will be 160_000_000
+
+      const revealData = serializePayload(payload);
+      const ticketId = randomBytes(32);
+      const secretSalt = randomBytes(32);
+      const commitment = createCommitment(
+        authority.publicKey,
+        policyPDA,
+        ticketId,
+        secretSalt,
+        revealData
+      );
+      const now = Math.floor(Date.now() / 1000);
+      const [ticketPDA] = findTicketPDA(program.programId, policyPDA, ticketId);
+
+      await program.methods
+        .createTicket(
+          Array.from(commitment) as any,
+          Array.from(ticketId) as any,
+          new anchor.BN(now + 3600)
+        )
+        .accounts({
+          ticket: ticketPDA,
+          policy: policyPDA,
+          owner: authority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+
+      const slot = await provider.connection.getSlot();
+      await oracleProgram.methods
+        .setFeed(new anchor.BN(160_000_000), new anchor.BN(slot))
+        .accounts({
+          feed: oracleFeed.publicKey,
+          authority: authority.publicKey,
+        })
+        .rpc();
+
+      try {
+        await program.methods
+          .executeTicket(Array.from(secretSalt) as any, revealData)
+          .accounts({
+            ticket: ticketPDA,
+            policy: policyPDA,
+            keeper: authority.publicKey,
+            oracle: oracleFeed.publicKey,
+          })
+          .rpc();
+        expect.fail("Should have thrown – predicate not met");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("PredicateNotMet");
+      }
+    });
+
+    it("rejects execute_ticket when oracle is stale (OracleStale)", async () => {
+      const payload = defaultPayload();
+      const revealData = serializePayload(payload);
+      const ticketId = randomBytes(32);
+      const secretSalt = randomBytes(32);
+      const commitment = createCommitment(
+        authority.publicKey,
+        policyPDA,
+        ticketId,
+        secretSalt,
+        revealData
+      );
+      const now = Math.floor(Date.now() / 1000);
+      const [ticketPDA] = findTicketPDA(program.programId, policyPDA, ticketId);
+
+      await program.methods
+        .createTicket(
+          Array.from(commitment) as any,
+          Array.from(ticketId) as any,
+          new anchor.BN(now + 3600)
+        )
+        .accounts({
+          ticket: ticketPDA,
+          policy: policyPDA,
+          owner: authority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+
+      const currentSlot = await provider.connection.getSlot();
+      const staleSlot = Math.max(0, currentSlot - 11); // policy.min_time_window = 10
+      await oracleProgram.methods
+        .setFeed(new anchor.BN(160_000_000), new anchor.BN(staleSlot))
+        .accounts({
+          feed: oracleFeed.publicKey,
+          authority: authority.publicKey,
+        })
+        .rpc();
+
+      try {
+        await program.methods
+          .executeTicket(Array.from(secretSalt) as any, revealData)
+          .accounts({
+            ticket: ticketPDA,
+            policy: policyPDA,
+            keeper: authority.publicKey,
+            oracle: oracleFeed.publicKey,
+          })
+          .rpc();
+        expect.fail("Should have thrown – oracle stale");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("OracleStale");
+      }
+    });
 
     it("rejects market_index not in policy allowlist", async () => {
       const payload = defaultPayload();
@@ -912,6 +1117,7 @@ describe("catalyst_guard", () => {
             ticket: ticketPDA,
             policy: policyPDA,
             keeper: authority.publicKey,
+            oracle: oracleFeed.publicKey,
           })
           .rpc();
         expect.fail("Should have thrown – invalid Borsh");
