@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CatalystGuard – v0.3 MVP</title>
+  <style>
+    :root {
+      --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3a;
+      --text: #e4e4e7; --muted: #71717a; --accent: #818cf8;
+      --green: #34d399; --red: #f87171; --yellow: #fbbf24;
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'SF Mono', 'Fira Code', monospace; background: var(--bg); color: var(--text); min-height: 100vh; }
+    .container { max-width: 960px; margin: 0 auto; padding: 2rem 1rem; }
+    h1 { font-size: 1.5rem; color: var(--accent); margin-bottom: 0.25rem; }
+    .subtitle { color: var(--muted); font-size: 0.85rem; margin-bottom: 2rem; }
+    .tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); margin-bottom: 1.5rem; }
+    .tab { padding: 0.75rem 1.25rem; cursor: pointer; color: var(--muted); border-bottom: 2px solid transparent; transition: all 0.2s; }
+    .tab:hover { color: var(--text); }
+    .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 1.25rem; margin-bottom: 1rem; }
+    .card h3 { font-size: 0.9rem; color: var(--accent); margin-bottom: 0.75rem; }
+    label { display: block; color: var(--muted); font-size: 0.75rem; margin-bottom: 0.25rem; margin-top: 0.75rem; }
+    input, select { width: 100%; padding: 0.5rem 0.75rem; background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text); font-family: inherit; font-size: 0.85rem; }
+    input:focus, select:focus { outline: none; border-color: var(--accent); }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    .row3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; }
+    button { padding: 0.6rem 1.25rem; border: none; border-radius: 6px; cursor: pointer; font-family: inherit; font-size: 0.85rem; font-weight: 600; transition: opacity 0.2s; }
+    button:hover { opacity: 0.85; }
+    .btn-primary { background: var(--accent); color: #fff; margin-top: 1rem; }
+    .btn-secondary { background: var(--border); color: var(--text); margin-top: 1rem; }
+    .status-badge { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 100px; font-size: 0.7rem; font-weight: 600; }
+    .status-open { background: rgba(59,130,246,0.15); color: #60a5fa; }
+    .status-executed { background: rgba(52,211,153,0.15); color: var(--green); }
+    .status-cancelled { background: rgba(248,113,113,0.15); color: var(--red); }
+    .status-expired { background: rgba(251,191,36,0.15); color: var(--yellow); }
+    table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    th { text-align: left; color: var(--muted); padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em; }
+    td { padding: 0.6rem 0.75rem; border-bottom: 1px solid var(--border); }
+    .hash { font-size: 0.75rem; color: var(--muted); word-break: break-all; }
+    .output-box { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 0.75rem; margin-top: 1rem; font-size: 0.8rem; word-break: break-all; min-height: 2.5rem; }
+    .wallet-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1.5rem; }
+    .wallet-status { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8rem; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; }
+    .dot-green { background: var(--green); }
+    .dot-red { background: var(--red); }
+    .empty { text-align: center; color: var(--muted); padding: 2rem; font-size: 0.85rem; }
+    .event-log { max-height: 300px; overflow-y: auto; }
+    .event-entry { padding: 0.5rem 0.75rem; border-bottom: 1px solid var(--border); font-size: 0.8rem; }
+    .event-entry .ts { color: var(--muted); font-size: 0.7rem; }
+    .checkbox-row { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.75rem; }
+    .checkbox-row input { width: auto; }
+    .policy-stat { text-align: center; }
+    .policy-stat .val { font-size: 1.5rem; font-weight: 700; color: var(--accent); }
+    .policy-stat .lbl { font-size: 0.7rem; color: var(--muted); text-transform: uppercase; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>⚡ CatalystGuard</h1>
+    <p class="subtitle">Sealed Conditional Intents for Drift v2 – MVP v0.3</p>
+
+    <div class="wallet-bar">
+      <div class="wallet-status">
+        <span class="dot dot-red" id="walletDot"></span>
+        <span id="walletLabel">Not connected</span>
+      </div>
+      <button class="btn-secondary" id="connectBtn" onclick="toggleWallet()">Connect Wallet</button>
+    </div>
+
+    <div class="tabs">
+      <div class="tab active" data-tab="dashboard">Dashboard</div>
+      <div class="tab" data-tab="create">Create Ticket</div>
+      <div class="tab" data-tab="policy">Policy</div>
+      <div class="tab" data-tab="events">Events</div>
+    </div>
+
+    <!-- Dashboard -->
+    <div class="panel active" id="panel-dashboard">
+      <div class="row3" style="margin-bottom:1rem;">
+        <div class="card policy-stat"><div class="val" id="statOpen">0</div><div class="lbl">Open</div></div>
+        <div class="card policy-stat"><div class="val" id="statExecuted">0</div><div class="lbl">Executed</div></div>
+        <div class="card policy-stat"><div class="val" id="statTotal">0</div><div class="lbl">Total</div></div>
+      </div>
+      <div class="card">
+        <h3>Tickets</h3>
+        <table>
+          <thead><tr><th>ID</th><th>Status</th><th>Commitment</th><th>Expiry</th><th>Action</th></tr></thead>
+          <tbody id="ticketTable"></tbody>
+        </table>
+        <div class="empty" id="noTickets">No tickets yet. Create one to get started.</div>
+      </div>
+    </div>
+
+    <!-- Create Ticket -->
+    <div class="panel" id="panel-create">
+      <div class="card">
+        <h3>Hedge Payload</h3>
+        <div class="row">
+          <div><label>Market Index</label><input type="number" id="marketIndex" value="0" min="0" max="65535" /></div>
+          <div><label>Trigger Direction</label><select id="triggerDir"><option value="0">Above</option><option value="1">Below</option></select></div>
+        </div>
+        <div class="row">
+          <div><label>Trigger Price (PRICE_PRECISION=1e6)</label><input type="number" id="triggerPrice" value="160000000" /></div>
+          <div><label>Side</label><select id="side"><option value="0">Long</option><option value="1">Short</option></select></div>
+        </div>
+        <div class="row">
+          <div><label>Base Amount (BASE_PRECISION=1e9)</label><input type="number" id="baseAmount" value="1000000000" /></div>
+          <div><label>Order Type</label><select id="orderType"><option value="0">Market</option><option value="1">Limit</option></select></div>
+        </div>
+        <div class="row">
+          <div><label>Limit Price (optional, 0 = none)</label><input type="number" id="limitPrice" value="0" /></div>
+          <div><label>Max Slippage BPS</label><input type="number" id="slippageBps" value="50" min="0" max="65535" /></div>
+        </div>
+        <div class="row">
+          <div><label>Deadline (Unix timestamp, 0 = +1h)</label><input type="number" id="deadline" value="0" /></div>
+          <div class="checkbox-row"><input type="checkbox" id="reduceOnly" /><label style="margin:0">Reduce Only</label></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>Commitment</h3>
+        <div class="row">
+          <div><label>Ticket ID (hex, 32 bytes)</label><input type="text" id="ticketId" placeholder="auto-generated" /></div>
+          <div><label>Secret Salt (hex, 32 bytes)</label><input type="text" id="secretSalt" placeholder="auto-generated" /></div>
+        </div>
+        <label>Serialized Payload (Borsh, hex)</label>
+        <div class="output-box" id="serializedPayload">–</div>
+        <label>SHA-256 Commitment Hash</label>
+        <div class="output-box" id="commitmentHash">–</div>
+        <div style="display:flex;gap:0.5rem">
+          <button class="btn-primary" onclick="computeCommitment()">Compute Commitment</button>
+          <button class="btn-primary" onclick="submitTicket()">Create Ticket</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Policy -->
+    <div class="panel" id="panel-policy">
+      <div class="card">
+        <h3>Policy Configuration</h3>
+        <div class="row">
+          <div><label>Authority</label><input type="text" id="policyAuthority" placeholder="Wallet pubkey" disabled /></div>
+          <div><label>Max Order Size</label><input type="number" id="policyMaxOrder" value="10000000000" /></div>
+        </div>
+        <div class="row">
+          <div><label>Allowed Markets (comma-separated)</label><input type="text" id="policyMarkets" value="0,1,5" /></div>
+          <div><label>Rate Limit / Window (0 = disabled)</label><input type="number" id="policyRateLimit" value="10" /></div>
+        </div>
+        <div class="row">
+          <div><label>Rate Limit Window (seconds)</label><input type="number" id="policyWindow" value="3600" /></div>
+          <div><label>Max Tickets</label><input type="number" id="policyMaxTickets" value="100" /></div>
+        </div>
+        <div class="checkbox-row"><input type="checkbox" id="policyReduceOnly" /><label style="margin:0">Only allow reduce-only orders</label></div>
+        <button class="btn-primary" onclick="savePolicy()">Initialize Policy</button>
+      </div>
+      <div class="card">
+        <h3>Policy Stats</h3>
+        <div class="row3">
+          <div class="policy-stat"><div class="val" id="pTicketCount">0</div><div class="lbl">Tickets Created</div></div>
+          <div class="policy-stat"><div class="val" id="pExecCount">0</div><div class="lbl">Executed</div></div>
+          <div class="policy-stat"><div class="val" id="pLastExec">–</div><div class="lbl">Last Executed</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Events -->
+    <div class="panel" id="panel-events">
+      <div class="card">
+        <h3>Event Log</h3>
+        <div class="event-log" id="eventLog">
+          <div class="empty" id="noEvents">No events yet. Events will appear here as tickets are created, executed, cancelled, or expired.</div>
+        </div>
+        <button class="btn-secondary" onclick="clearEvents()">Clear Log</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ── State ────────────────────────────────────
+    let connected = false;
+    let mockWallet = null;
+    let tickets = [];
+    let events = [];
+    let ticketCounter = 0;
+
+    // ── Tab switching ────────────────────────────
+    document.querySelectorAll('.tab').forEach(t => {
+      t.addEventListener('click', () => {
+        document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+        document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
+        t.classList.add('active');
+        document.getElementById('panel-' + t.dataset.tab).classList.add('active');
+      });
+    });
+
+    // ── Wallet ───────────────────────────────────
+    function toggleWallet() {
+      if (connected) {
+        connected = false; mockWallet = null;
+        document.getElementById('walletDot').className = 'dot dot-red';
+        document.getElementById('walletLabel').textContent = 'Not connected';
+        document.getElementById('connectBtn').textContent = 'Connect Wallet';
+        document.getElementById('policyAuthority').value = '';
+      } else {
+        mockWallet = randomHex(32);
+        connected = true;
+        document.getElementById('walletDot').className = 'dot dot-green';
+        document.getElementById('walletLabel').textContent = mockWallet.slice(0,8) + '...' + mockWallet.slice(-8);
+        document.getElementById('connectBtn').textContent = 'Disconnect';
+        document.getElementById('policyAuthority').value = mockWallet;
+      }
+    }
+
+    // ── Helpers ──────────────────────────────────
+    function randomHex(n) {
+      const a = new Uint8Array(n);
+      crypto.getRandomValues(a);
+      return Array.from(a, b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    function hexToBytes(hex) {
+      const bytes = new Uint8Array(hex.length / 2);
+      for (let i = 0; i < hex.length; i += 2) bytes[i/2] = parseInt(hex.substr(i, 2), 16);
+      return bytes;
+    }
+
+    function bytesToHex(bytes) {
+      return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    function writeU16LE(buf, val) { buf.push(val & 0xff, (val >> 8) & 0xff); }
+    function writeU64LE(buf, val) {
+      // JS BigInt for u64
+      const b = BigInt(val);
+      for (let i = 0; i < 8; i++) buf.push(Number((b >> BigInt(i*8)) & 0xffn));
+    }
+    function writeI64LE(buf, val) { writeU64LE(buf, val < 0 ? val + 2**64 : val); }
+
+    // ── Borsh Serialization ─────────────────────
+    function serializePayload() {
+      const buf = [];
+      writeU16LE(buf, parseInt(document.getElementById('marketIndex').value));
+      buf.push(parseInt(document.getElementById('triggerDir').value));
+      writeU64LE(buf, document.getElementById('triggerPrice').value);
+      buf.push(parseInt(document.getElementById('side').value));
+      writeU64LE(buf, document.getElementById('baseAmount').value);
+      buf.push(document.getElementById('reduceOnly').checked ? 1 : 0);
+      buf.push(parseInt(document.getElementById('orderType').value));
+      const lp = parseInt(document.getElementById('limitPrice').value);
+      if (lp > 0) { buf.push(1); writeU64LE(buf, lp); }
+      else { buf.push(0); }
+      writeU16LE(buf, parseInt(document.getElementById('slippageBps').value));
+      let dl = parseInt(document.getElementById('deadline').value);
+      if (dl === 0) dl = Math.floor(Date.now()/1000) + 3600;
+      writeI64LE(buf, dl);
+      return new Uint8Array(buf);
+    }
+
+    // ── SHA-256 Commitment ──────────────────────
+    async function sha256(data) {
+      const hash = await crypto.subtle.digest('SHA-256', data);
+      return new Uint8Array(hash);
+    }
+
+    async function computeCommitment() {
+      if (!connected) { alert('Connect wallet first'); return; }
+      // Auto-generate ticket ID and salt if empty
+      if (!document.getElementById('ticketId').value) {
+        document.getElementById('ticketId').value = randomHex(32);
+      }
+      if (!document.getElementById('secretSalt').value) {
+        document.getElementById('secretSalt').value = randomHex(32);
+      }
+
+      const payload = serializePayload();
+      document.getElementById('serializedPayload').textContent = bytesToHex(payload);
+
+      // commitment = SHA-256("CSv0.2" || owner || policy || ticket_id || salt || payload)
+      const domain = new TextEncoder().encode('CSv0.2');
+      const owner = hexToBytes(mockWallet);
+      const policy = hexToBytes(randomHex(32)); // mock policy key
+      const ticketId = hexToBytes(document.getElementById('ticketId').value);
+      const salt = hexToBytes(document.getElementById('secretSalt').value);
+
+      const preimage = new Uint8Array(domain.length + 32 + 32 + 32 + 32 + payload.length);
+      let off = 0;
+      preimage.set(domain, off); off += domain.length;
+      preimage.set(owner, off); off += 32;
+      preimage.set(policy, off); off += 32;
+      preimage.set(ticketId, off); off += 32;
+      preimage.set(salt, off); off += 32;
+      preimage.set(payload, off);
+
+      const hash = await sha256(preimage);
+      document.getElementById('commitmentHash').textContent = bytesToHex(hash);
+    }
+
+    async function submitTicket() {
+      const commitment = document.getElementById('commitmentHash').textContent;
+      if (commitment === '–' || !connected) {
+        alert('Compute commitment first'); return;
+      }
+
+      ticketCounter++;
+      const ticket = {
+        id: ticketCounter,
+        ticketId: document.getElementById('ticketId').value.slice(0,16) + '...',
+        status: 'open',
+        commitment: commitment.slice(0, 16) + '...',
+        expiry: new Date(Date.now() + 3600000).toISOString().replace('T', ' ').slice(0,19),
+        payload: {
+          market: document.getElementById('marketIndex').value,
+          dir: document.getElementById('triggerDir').selectedOptions[0].text,
+          price: document.getElementById('triggerPrice').value,
+          side: document.getElementById('side').selectedOptions[0].text,
+          amount: document.getElementById('baseAmount').value,
+        }
+      };
+      tickets.push(ticket);
+      addEvent('TicketCreated', `Ticket #${ticket.id} created | market=${ticket.payload.market} | ${ticket.payload.dir} ${ticket.payload.price}`);
+      refreshDashboard();
+
+      // Reset fields
+      document.getElementById('ticketId').value = '';
+      document.getElementById('secretSalt').value = '';
+      document.getElementById('commitmentHash').textContent = '–';
+      document.getElementById('serializedPayload').textContent = '–';
+
+      // Switch to dashboard
+      document.querySelector('[data-tab="dashboard"]').click();
+    }
+
+    // ── Dashboard ────────────────────────────────
+    function refreshDashboard() {
+      const open = tickets.filter(t => t.status === 'open').length;
+      const exec = tickets.filter(t => t.status === 'executed').length;
+      document.getElementById('statOpen').textContent = open;
+      document.getElementById('statExecuted').textContent = exec;
+      document.getElementById('statTotal').textContent = tickets.length;
+
+      const tbody = document.getElementById('ticketTable');
+      const empty = document.getElementById('noTickets');
+      if (!tickets.length) { empty.style.display = ''; tbody.innerHTML = ''; return; }
+      empty.style.display = 'none';
+
+      tbody.innerHTML = tickets.map(t => `
+        <tr>
+          <td>#${t.id}</td>
+          <td><span class="status-badge status-${t.status}">${t.status.toUpperCase()}</span></td>
+          <td class="hash">${t.commitment}</td>
+          <td>${t.expiry}</td>
+          <td>
+            ${t.status === 'open' ? `
+              <button class="btn-secondary" style="padding:0.25rem 0.5rem;font-size:0.7rem;margin:0 0.25rem 0 0" onclick="executeTicket(${t.id})">Execute</button>
+              <button class="btn-secondary" style="padding:0.25rem 0.5rem;font-size:0.7rem;margin:0" onclick="cancelTicket(${t.id})">Cancel</button>
+            ` : '–'}
+          </td>
+        </tr>
+      `).join('');
+    }
+
+    function executeTicket(id) {
+      const t = tickets.find(x => x.id === id);
+      if (t) { t.status = 'executed'; addEvent('TicketExecuted', `Ticket #${id} executed`); refreshDashboard(); }
+    }
+    function cancelTicket(id) {
+      const t = tickets.find(x => x.id === id);
+      if (t) { t.status = 'cancelled'; addEvent('TicketCancelled', `Ticket #${id} cancelled`); refreshDashboard(); }
+    }
+
+    // ── Events ───────────────────────────────────
+    function addEvent(type, msg) {
+      events.unshift({ type, msg, ts: new Date().toISOString().replace('T',' ').slice(0,19) });
+      refreshEvents();
+    }
+    function refreshEvents() {
+      const el = document.getElementById('eventLog');
+      const empty = document.getElementById('noEvents');
+      if (!events.length) { empty.style.display = ''; return; }
+      empty.style.display = 'none';
+      el.innerHTML = events.map(e => `
+        <div class="event-entry">
+          <span class="ts">${e.ts}</span> <strong>${e.type}</strong> — ${e.msg}
+        </div>
+      `).join('');
+    }
+    function clearEvents() { events = []; refreshEvents(); }
+
+    // ── Policy ───────────────────────────────────
+    function savePolicy() {
+      if (!connected) { alert('Connect wallet first'); return; }
+      addEvent('PolicyInitialized', `Policy created: markets=[${document.getElementById('policyMarkets').value}] maxOrder=${document.getElementById('policyMaxOrder').value}`);
+      alert('Policy initialized (mock). In production this sends an on-chain transaction.');
+    }
+  </script>
+</body>
+</html>
