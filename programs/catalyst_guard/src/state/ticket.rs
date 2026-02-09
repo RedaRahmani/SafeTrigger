@@ -21,11 +21,12 @@ pub enum TicketStatus {
 /// A ticket holds a SHA-256 commitment hash (no plaintext trigger params)
 /// and tracks its lifecycle: Open → Executed / Cancelled / Expired.
 ///
-/// **Invariant P1**: `commitment` is a SHA-256 hash of the trigger + order
-/// params concatenated with a random nonce. The plaintext is never stored.
+/// **Invariant P1**: `commitment` is a domain-separated SHA-256 hash:
+///   `SHA-256(b"CSv0.2" || owner || policy || ticket_id || secret_salt || revealed_payload)`
+/// The secret salt and plaintext payload are never stored on-chain.
 ///
 /// **Invariant P3**: Once `status != Open`, the ticket cannot be re-executed.
-/// The `nonce` provides additional replay protection across tickets.
+/// The `ticket_id` provides PDA uniqueness and replay protection.
 #[account]
 #[derive(Debug)]
 pub struct Ticket {
@@ -35,12 +36,12 @@ pub struct Ticket {
     /// The policy this ticket is bound to.
     pub policy: Pubkey,
 
-    /// SHA-256 commitment hash = H(trigger_params || order_params || nonce).
+    /// SHA-256 commitment hash (domain-separated, owner/policy-bound).
     pub commitment: [u8; 32],
 
-    /// Random nonce used in the commitment (stored for efficient indexing).
-    /// The full preimage is only known off-chain until reveal.
-    pub nonce: [u8; 32],
+    /// Public ticket identifier used for PDA derivation.
+    /// NOT a secret — the secret salt is provided only at execute time.
+    pub ticket_id: [u8; 32],
 
     /// Bump for PDA derivation.
     pub bump: u8,
@@ -70,7 +71,7 @@ impl Ticket {
         + 32  // owner
         + 32  // policy
         + 32  // commitment
-        + 32  // nonce
+        + 32  // ticket_id
         + 1   // bump
         + 1   // status (enum, 1 byte via Borsh)
         + 8   // expiry
@@ -100,7 +101,7 @@ mod tests {
             owner: Pubkey::default(),
             policy: Pubkey::default(),
             commitment: [0u8; 32],
-            nonce: [0u8; 32],
+            ticket_id: [0u8; 32],
             bump: 255,
             status: TicketStatus::Open,
             expiry: 1_000_000,
@@ -119,6 +120,9 @@ mod tests {
     #[test]
     fn test_space_constant() {
         // Ensure space is reasonable
+        // 8 disc + 32 owner + 32 policy + 32 commitment + 32 ticket_id
+        // + 1 bump + 1 status + 8 expiry + 8 created_slot + 8 created_at
+        // + 8 updated_at + 8 executed_slot
         assert_eq!(
             Ticket::SPACE,
             8 + 32 + 32 + 32 + 32 + 1 + 1 + 8 + 8 + 8 + 8 + 8

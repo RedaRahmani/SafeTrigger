@@ -7,6 +7,9 @@ use crate::error::CatalystError;
 use crate::state::policy::{Policy, POLICY_SEED};
 use crate::state::ticket::*;
 
+/// Domain separator for commitment preimage (version 0.2).
+pub const COMMITMENT_DOMAIN: &[u8] = b"CSv0.2";
+
 /// Maximum ticket expiry: 7 days from now.
 pub const MAX_EXPIRY_WINDOW: i64 = 7 * 24 * 60 * 60;
 
@@ -38,7 +41,7 @@ pub struct CreateTicket<'info> {
 pub fn handle_create_ticket(
     ctx: Context<CreateTicket>,
     commitment: [u8; 32],
-    nonce: [u8; 32],
+    ticket_id: [u8; 32],
     expiry: i64,
 ) -> Result<()> {
     let clock = Clock::get()?;
@@ -57,7 +60,7 @@ pub fn handle_create_ticket(
     ticket.owner = ctx.accounts.owner.key();
     ticket.policy = ctx.accounts.policy.key();
     ticket.commitment = commitment;
-    ticket.nonce = nonce;
+    ticket.ticket_id = ticket_id;
     ticket.bump = ctx.bumps.ticket;
     ticket.status = TicketStatus::Open;
     ticket.expiry = expiry;
@@ -140,7 +143,7 @@ pub struct ExecuteTicket<'info> {
         has_one = policy @ CatalystError::PolicyMismatch,
         constraint = ticket.is_open() @ CatalystError::TicketAlreadyConsumed,
         constraint = !ticket.is_expired(Clock::get()?.unix_timestamp) @ CatalystError::TicketExpired,
-        seeds = [TICKET_SEED, ticket.policy.as_ref(), ticket.nonce.as_ref()],
+        seeds = [TICKET_SEED, ticket.policy.as_ref(), ticket.ticket_id.as_ref()],
         bump = ticket.bump,
     )]
     pub ticket: Account<'info, Ticket>,
@@ -158,15 +161,23 @@ pub struct ExecuteTicket<'info> {
     // For M0, we verify the commitment and mark executed without CPI.
 }
 
-pub fn handle_execute_ticket(ctx: Context<ExecuteTicket>, revealed_data: Vec<u8>) -> Result<()> {
+pub fn handle_execute_ticket(
+    ctx: Context<ExecuteTicket>,
+    secret_salt: [u8; 32],
+    revealed_data: Vec<u8>,
+) -> Result<()> {
     let ticket = &mut ctx.accounts.ticket;
     let clock = Clock::get()?;
 
-    // ── P2: Verify commitment ───────────────────────────────────
-    // The revealed_data must hash (with the ticket's nonce) to the stored commitment.
+    // ── P2: Verify commitment (domain-separated, owner/policy-bound) ──
+    // commitment = SHA-256(b"CSv0.2" || owner || policy || ticket_id || secret_salt || revealed_data)
     let mut hasher = Sha256::new();
+    hasher.update(COMMITMENT_DOMAIN);
+    hasher.update(ticket.owner.as_ref());
+    hasher.update(ticket.policy.as_ref());
+    hasher.update(ticket.ticket_id);
+    hasher.update(secret_salt);
     hasher.update(&revealed_data);
-    hasher.update(ticket.nonce);
     let computed_hash: [u8; 32] = hasher.finalize().into();
 
     require!(

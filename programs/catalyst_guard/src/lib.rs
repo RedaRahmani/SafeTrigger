@@ -74,10 +74,10 @@ pub mod catalyst_guard {
     pub fn create_ticket(
         ctx: Context<CreateTicket>,
         commitment: [u8; 32],
-        nonce: [u8; 32],
+        ticket_id: [u8; 32],
         expiry: i64,
     ) -> Result<()> {
-        instructions::ticket::handle_create_ticket(ctx, commitment, nonce, expiry)
+        instructions::ticket::handle_create_ticket(ctx, commitment, ticket_id, expiry)
     }
 
     /// Cancel a ticket. Owner-only.
@@ -94,7 +94,11 @@ pub mod catalyst_guard {
     /// Invariant P2: reveal is coupled to execution.
     /// Invariant P3: replay protection via consumed flag.
     /// Invariant P4: CPI is hard-allowlisted.
-    pub fn execute_ticket(ctx: Context<ExecuteTicket>, revealed_data: Vec<u8>) -> Result<()> {
-        instructions::ticket::handle_execute_ticket(ctx, revealed_data)
+    pub fn execute_ticket(
+        ctx: Context<ExecuteTicket>,
+        secret_salt: [u8; 32],
+        revealed_data: Vec<u8>,
+    ) -> Result<()> {
+        instructions::ticket::handle_execute_ticket(ctx, secret_salt, revealed_data)
     }
 }

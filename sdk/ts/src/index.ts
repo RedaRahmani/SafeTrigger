@@ -2,7 +2,7 @@
  * CatalystGuard TypeScript SDK
  *
  * Provides helpers for:
- * - Creating commitment hashes (SHA-256)
+ * - Creating commitment hashes (SHA-256, domain-separated)
  * - Building ticket creation transactions
  * - Reading policy and ticket accounts
  *
@@ -21,33 +21,51 @@ export const CATALYST_GUARD_PROGRAM_ID = new PublicKey(
 export const POLICY_SEED = Buffer.from("policy");
 export const TICKET_SEED = Buffer.from("ticket");
 
+/** Domain separator for commitment preimage (must match on-chain constant). */
+export const COMMITMENT_DOMAIN = Buffer.from("CSv0.2");
+
 // ── Commitment helpers ──────────────────────────────────────────
 
 /**
- * Generate a random 32-byte nonce.
+ * Generate a random 32-byte ticket ID (public identifier for PDA seeds).
  */
-export function generateNonce(): Uint8Array {
-  const nonce = new Uint8Array(32);
-  crypto.getRandomValues(nonce);
-  return nonce;
+export function generateTicketId(): Uint8Array {
+  const id = new Uint8Array(32);
+  crypto.getRandomValues(id);
+  return id;
 }
 
 /**
- * Create a SHA-256 commitment hash from trigger params + order params + nonce.
+ * Generate a random 32-byte secret salt (kept off-chain until execute).
+ */
+export function generateSecretSalt(): Uint8Array {
+  const salt = new Uint8Array(32);
+  crypto.getRandomValues(salt);
+  return salt;
+}
+
+/**
+ * Create a domain-separated SHA-256 commitment hash.
  *
- * The commitment = SHA-256(revealData || nonce)
+ * commitment = SHA-256(b"CSv0.2" || owner || policy || ticketId || secretSalt || revealData)
  *
- * This matches the on-chain verification logic.
+ * This matches the on-chain verification logic in execute_ticket.
  */
 export function createCommitment(
-  revealData: Uint8Array,
-  nonce: Uint8Array
+  owner: PublicKey,
+  policy: PublicKey,
+  ticketId: Uint8Array,
+  secretSalt: Uint8Array,
+  revealData: Uint8Array
 ): Uint8Array {
-  const combined = new Uint8Array(revealData.length + nonce.length);
-  combined.set(revealData, 0);
-  combined.set(nonce, revealData.length);
-  const hash = sha256.arrayBuffer(combined);
-  return new Uint8Array(hash);
+  const hasher = sha256.create();
+  hasher.update(COMMITMENT_DOMAIN);
+  hasher.update(owner.toBytes());
+  hasher.update(policy.toBytes());
+  hasher.update(ticketId);
+  hasher.update(secretSalt);
+  hasher.update(revealData);
+  return new Uint8Array(hasher.arrayBuffer());
 }
 
 // ── PDA derivation ──────────────────────────────────────────────
@@ -70,10 +88,10 @@ export function findPolicyAddress(
  */
 export function findTicketAddress(
   policy: PublicKey,
-  nonce: Uint8Array
+  ticketId: Uint8Array
 ): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
-    [TICKET_SEED, policy.toBuffer(), Buffer.from(nonce)],
+    [TICKET_SEED, policy.toBuffer(), Buffer.from(ticketId)],
     CATALYST_GUARD_PROGRAM_ID
   );
 }

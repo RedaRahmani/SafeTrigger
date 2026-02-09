@@ -9,6 +9,7 @@ import { expect } from "chai";
 
 const POLICY_SEED = Buffer.from("policy");
 const TICKET_SEED = Buffer.from("ticket");
+const COMMITMENT_DOMAIN = Buffer.from("CSv0.2");
 
 function findPolicyPDA(
   programId: PublicKey,
@@ -24,18 +25,32 @@ function findPolicyPDA(
 function findTicketPDA(
   programId: PublicKey,
   policy: PublicKey,
-  nonce: Buffer
+  ticketId: Buffer
 ): [PublicKey, number] {
   return PublicKey.findProgramAddressSync(
-    [TICKET_SEED, policy.toBuffer(), nonce],
+    [TICKET_SEED, policy.toBuffer(), ticketId],
     programId
   );
 }
 
-function createCommitment(revealData: Buffer, nonce: Buffer): Buffer {
+/**
+ * Domain-separated commitment:
+ * SHA-256(b"CSv0.2" || owner || policy || ticketId || secretSalt || revealData)
+ */
+function createCommitment(
+  owner: PublicKey,
+  policy: PublicKey,
+  ticketId: Buffer,
+  secretSalt: Buffer,
+  revealData: Buffer
+): Buffer {
   const hasher = createHash("sha256");
+  hasher.update(COMMITMENT_DOMAIN);
+  hasher.update(owner.toBuffer());
+  hasher.update(policy.toBuffer());
+  hasher.update(ticketId);
+  hasher.update(secretSalt);
   hasher.update(revealData);
-  hasher.update(nonce);
   return hasher.digest();
 }
 
@@ -167,11 +182,20 @@ describe("catalyst_guard", () => {
 
   describe("Ticket Lifecycle", () => {
     const revealData = Buffer.from("trigger:SOL-PERP,price>150,amount=1000");
-    const nonce = randomBytes(32);
-    const commitment = createCommitment(revealData, nonce);
+    const ticketId = randomBytes(32);
+    const secretSalt = randomBytes(32);
+    let commitment: Buffer;
     let ticketPDA: PublicKey;
 
     it("creates a ticket with commitment hash", async () => {
+      commitment = createCommitment(
+        authority.publicKey,
+        policyPDA,
+        ticketId,
+        secretSalt,
+        revealData
+      );
+
       // Expiry = now + 1 hour
       const now = Math.floor(Date.now() / 1000);
       const expiry = new anchor.BN(now + 3600);
@@ -179,13 +203,13 @@ describe("catalyst_guard", () => {
       [ticketPDA] = findTicketPDA(
         program.programId,
         policyPDA,
-        nonce
+        ticketId
       );
 
       const tx = await program.methods
         .createTicket(
           Array.from(commitment) as any,
-          Array.from(nonce) as any,
+          Array.from(ticketId) as any,
           expiry
         )
         .accounts({
@@ -203,7 +227,7 @@ describe("catalyst_guard", () => {
         authority.publicKey.toBase58()
       );
       expect(Buffer.from(ticketAccount.commitment)).to.deep.equal(commitment);
-      expect(Buffer.from(ticketAccount.nonce)).to.deep.equal(nonce);
+      expect(Buffer.from(ticketAccount.ticketId)).to.deep.equal(ticketId);
       expect(ticketAccount.status).to.deep.equal({ open: {} });
     });
 
@@ -224,7 +248,7 @@ describe("catalyst_guard", () => {
 
     it("executes a ticket with valid reveal (P2 + P3)", async () => {
       const tx = await program.methods
-        .executeTicket(revealData)
+        .executeTicket(Array.from(secretSalt) as any, revealData)
         .accounts({
           ticket: ticketPDA,
           policy: policyPDA,
@@ -242,7 +266,7 @@ describe("catalyst_guard", () => {
     it("P3: replay protection – cannot execute consumed ticket", async () => {
       try {
         await program.methods
-          .executeTicket(revealData)
+          .executeTicket(Array.from(secretSalt) as any, revealData)
           .accounts({
             ticket: ticketPDA,
             policy: policyPDA,
@@ -257,20 +281,27 @@ describe("catalyst_guard", () => {
 
     it("rejects execution with wrong reveal data (P2)", async () => {
       // Create a new ticket to test bad reveal
-      const nonce2 = randomBytes(32);
-      const commitment2 = createCommitment(revealData, nonce2);
+      const ticketId2 = randomBytes(32);
+      const secretSalt2 = randomBytes(32);
+      const commitment2 = createCommitment(
+        authority.publicKey,
+        policyPDA,
+        ticketId2,
+        secretSalt2,
+        revealData
+      );
       const now = Math.floor(Date.now() / 1000);
 
       const [ticketPDA2] = findTicketPDA(
         program.programId,
         policyPDA,
-        nonce2
+        ticketId2
       );
 
       await program.methods
         .createTicket(
           Array.from(commitment2) as any,
-          Array.from(nonce2) as any,
+          Array.from(ticketId2) as any,
           new anchor.BN(now + 3600)
         )
         .accounts({
@@ -285,7 +316,7 @@ describe("catalyst_guard", () => {
       const wrongReveal = Buffer.from("WRONG DATA");
       try {
         await program.methods
-          .executeTicket(wrongReveal)
+          .executeTicket(Array.from(secretSalt2) as any, wrongReveal)
           .accounts({
             ticket: ticketPDA2,
             policy: policyPDA,
@@ -303,21 +334,28 @@ describe("catalyst_guard", () => {
 
   describe("Cancel and Expire", () => {
     it("owner can cancel an open ticket", async () => {
-      const nonce3 = randomBytes(32);
+      const ticketId3 = randomBytes(32);
+      const secretSalt3 = randomBytes(32);
       const revealData3 = Buffer.from("cancel-test");
-      const commitment3 = createCommitment(revealData3, nonce3);
+      const commitment3 = createCommitment(
+        authority.publicKey,
+        policyPDA,
+        ticketId3,
+        secretSalt3,
+        revealData3
+      );
       const now = Math.floor(Date.now() / 1000);
 
       const [ticketPDA3] = findTicketPDA(
         program.programId,
         policyPDA,
-        nonce3
+        ticketId3
       );
 
       await program.methods
         .createTicket(
           Array.from(commitment3) as any,
-          Array.from(nonce3) as any,
+          Array.from(ticketId3) as any,
           new anchor.BN(now + 3600)
         )
         .accounts({
@@ -341,20 +379,27 @@ describe("catalyst_guard", () => {
     });
 
     it("rejects ticket creation with past expiry", async () => {
-      const nonce4 = randomBytes(32);
-      const commitment4 = createCommitment(Buffer.from("past"), nonce4);
+      const ticketId4 = randomBytes(32);
+      const secretSalt4 = randomBytes(32);
+      const commitment4 = createCommitment(
+        authority.publicKey,
+        policyPDA,
+        ticketId4,
+        secretSalt4,
+        Buffer.from("past")
+      );
 
       const [ticketPDA4] = findTicketPDA(
         program.programId,
         policyPDA,
-        nonce4
+        ticketId4
       );
 
       try {
         await program.methods
           .createTicket(
             Array.from(commitment4) as any,
-            Array.from(nonce4) as any,
+            Array.from(ticketId4) as any,
             new anchor.BN(1000) // way in the past
           )
           .accounts({
@@ -402,21 +447,28 @@ describe("catalyst_guard", () => {
         .rpc();
 
       // 2. Create a ticket under policy A
-      const nonceBypass = randomBytes(32);
+      const ticketIdBypass = randomBytes(32);
+      const secretSaltBypass = randomBytes(32);
       const revealDataBypass = Buffer.from("bypass-test");
-      const commitmentBypass = createCommitment(revealDataBypass, nonceBypass);
+      const commitmentBypass = createCommitment(
+        authority.publicKey,
+        policyPDA,
+        ticketIdBypass,
+        secretSaltBypass,
+        revealDataBypass
+      );
       const now = Math.floor(Date.now() / 1000);
 
       const [ticketBypassPDA] = findTicketPDA(
         program.programId,
         policyPDA,  // ticket is under policy A
-        nonceBypass
+        ticketIdBypass
       );
 
       await program.methods
         .createTicket(
           Array.from(commitmentBypass) as any,
-          Array.from(nonceBypass) as any,
+          Array.from(ticketIdBypass) as any,
           new anchor.BN(now + 3600)
         )
         .accounts({
@@ -439,7 +491,7 @@ describe("catalyst_guard", () => {
       // 4. Attempt to execute the ticket with policy B (unpaused) – must FAIL
       try {
         await program.methods
-          .executeTicket(revealDataBypass)
+          .executeTicket(Array.from(secretSaltBypass) as any, revealDataBypass)
           .accounts({
             ticket: ticketBypassPDA,
             policy: policyBPDA,  // wrong policy!
@@ -467,6 +519,81 @@ describe("catalyst_guard", () => {
           authority: authority.publicKey,
         })
         .rpc();
+    });
+  });
+
+  // ── Commitment binding negative tests ───────────────────────
+
+  describe("Commitment binding (domain-separated)", () => {
+    let commitTicketId: Buffer;
+    let commitSecretSalt: Buffer;
+    let commitRevealData: Buffer;
+    let commitTicketPDA: PublicKey;
+
+    before(async () => {
+      commitTicketId = randomBytes(32);
+      commitSecretSalt = randomBytes(32);
+      commitRevealData = Buffer.from("commitment-binding-test");
+
+      const commitment = createCommitment(
+        authority.publicKey,
+        policyPDA,
+        commitTicketId,
+        commitSecretSalt,
+        commitRevealData
+      );
+      const now = Math.floor(Date.now() / 1000);
+
+      [commitTicketPDA] = findTicketPDA(
+        program.programId,
+        policyPDA,
+        commitTicketId
+      );
+
+      await program.methods
+        .createTicket(
+          Array.from(commitment) as any,
+          Array.from(commitTicketId) as any,
+          new anchor.BN(now + 3600)
+        )
+        .accounts({
+          ticket: commitTicketPDA,
+          policy: policyPDA,
+          owner: authority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+    });
+
+    it("rejects execution with wrong secret salt", async () => {
+      const wrongSalt = randomBytes(32);
+      try {
+        await program.methods
+          .executeTicket(Array.from(wrongSalt) as any, commitRevealData)
+          .accounts({
+            ticket: commitTicketPDA,
+            policy: policyPDA,
+            keeper: authority.publicKey,
+          })
+          .rpc();
+        expect.fail("Should have thrown – wrong salt");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("CommitmentMismatch");
+      }
+    });
+
+    it("succeeds with correct salt and reveal data", async () => {
+      const tx = await program.methods
+        .executeTicket(Array.from(commitSecretSalt) as any, commitRevealData)
+        .accounts({
+          ticket: commitTicketPDA,
+          policy: policyPDA,
+          keeper: authority.publicKey,
+        })
+        .rpc();
+
+      const ticketAccount = await program.account.ticket.fetch(commitTicketPDA);
+      expect(ticketAccount.status).to.deep.equal({ executed: {} });
     });
   });
 });
