@@ -52,6 +52,28 @@ pub enum CatalystError {
     #[msg("Order params violate policy bounds")]
     OrderParamsViolation,
 
+    // ── Payload / predicate errors ──────────────────────────────
+    #[msg("Market index not in policy allowlist")]
+    MarketNotAllowed,
+
+    #[msg("Base amount exceeds policy max")]
+    BaseAmountExceeded,
+
+    #[msg("Policy requires reduce_only but payload is not")]
+    ReduceOnlyViolation,
+
+    #[msg("Payload deadline has passed")]
+    DeadlineExpired,
+
+    #[msg("Trigger predicate not satisfied")]
+    PredicateNotMet,
+
+    #[msg("Oracle price is stale")]
+    OracleStale,
+
+    #[msg("Rate limit exceeded for this policy window")]
+    RateLimitExceeded,
+
     // ── Access control ──────────────────────────────────────────
     #[msg("Unauthorized: signer is not the authority")]
     Unauthorized,
