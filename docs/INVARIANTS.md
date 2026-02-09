@@ -1,7 +1,7 @@
-# On-Chain Invariants – Catalyst Shield v0.2
+# On-Chain Invariants – Catalyst Shield v0.3
 
 > These invariants MUST be enforced in the Anchor program and verified by tests.
-> Last updated: 2026-02-09 (post-audit hardening M0.1).
+> Last updated: 2026-02-10 (M1 MVP v0.3).
 
 ## P1: No Plaintext Triggers On-Chain
 
@@ -51,8 +51,11 @@ Where:
 3. Program verifies computed hash == `ticket.commitment`
 4. Program validates `ticket.policy == policy.key()` (has_one constraint)
 5. Program validates policy is not paused
-6. In M1: program evaluates predicate + CPI to Drift
-7. Ticket status is set to `Executed`
+6. Program deserializes `HedgePayloadV1` from revealed data (Borsh)
+7. Program validates payload against policy bounds (market allowlist, max size, reduce-only, deadline)
+8. Program checks rate limiting (min interval between executions)
+9. Program constructs `BoundedOrderParams` and CPI data for Drift `place_perp_order`
+10. Ticket status is set to `Executed`; policy counters updated
 
 **Rationale:** Domain separation prevents hash collisions across protocols. Owner and policy binding prevent commitment replay across different owners or policies. Secret salt prevents brute-forcing low-entropy revealed data.
 
@@ -86,7 +89,7 @@ Where:
       └──→ Expired (status=Expired)      [expire_ticket, permissionless after expiry]
 ```
 
-**Note (M0):** Cancelled and Expired tickets keep accounts alive with status set. Accounts are NOT closed in M0. This may change in M1 with `close = owner` for cancelled tickets.
+**Note (M0):** Cancelled and Expired tickets keep accounts alive with status set. Accounts are NOT closed in M0. This may change with `close = owner` for cancelled tickets.
 
 **PDA seeds:**
 - Policy: `[b"policy", authority_pubkey, drift_sub_account_pubkey]`
@@ -105,7 +108,7 @@ Where:
 
 **Statement:** CPI targets are hard-allowlisted. No user-supplied `program_id` for CPI. No arbitrary instruction forwarding. Strict account validation.
 
-> **Note:** CPI to Drift is stubbed in M0 (no actual CPI calls). The infrastructure (constants, allowlists) is in place for M1.
+> **Note:** CPI to Drift constructs validated instruction data but actual `invoke` is gated on Drift deployment. On localnet (no Drift), all validation occurs but invoke is skipped.
 
 **Enforced rules:**
 
@@ -176,3 +179,86 @@ MVP does NOT use the instruction sysvar (`Sysvar<Instructions>`) to inspect surr
 
 ### Attack: Brute-force low-entropy revealed data
 **Mitigation:** 32-byte secret salt is included in the commitment preimage and never stored on-chain.
+
+---
+
+## P6: Payload Validation (M1)
+
+**Statement:** The revealed payload (`HedgePayloadV1`) is validated against policy bounds before any CPI data is constructed.
+
+**HedgePayloadV1 fields** (Borsh-serialized):
+| Field | Type | Description |
+|-------|------|-------------|
+| `market_index` | u16 | Drift perp market index |
+| `trigger_direction` | enum(u8) | `Above=0, Below=1` |
+| `trigger_price` | u64 | PRICE_PRECISION (1e6) |
+| `side` | enum(u8) | `Long=0, Short=1` |
+| `base_amount` | u64 | BASE_PRECISION (1e9) |
+| `reduce_only` | bool(u8) | Whether order is reduce-only |
+| `order_type` | enum(u8) | `Market=0, Limit=1` |
+| `limit_price` | Option\<u64\> | Required for Limit orders |
+| `max_slippage_bps` | u16 | Max slippage basis points |
+| `deadline_ts` | i64 | Unix timestamp deadline |
+
+**Validation rules:**
+1. `market_index` must be in `policy.allowed_markets` → `MarketNotAllowed`
+2. `base_amount` must be ≤ `policy.max_base_amount` → `BaseAmountExceeded`
+3. If `policy.reduce_only == true`, payload must have `reduce_only == true` → `ReduceOnlyViolation`
+4. `deadline_ts` must be > current clock timestamp → `DeadlineExpired`
+5. Limit orders must include a non-zero `limit_price` → `InvalidRevealData`
+6. Invalid Borsh serialization → `InvalidRevealData`
+
+**Test requirements:**
+- Negative: market not in allowlist → MarketNotAllowed
+- Negative: base amount exceeds max → BaseAmountExceeded
+- Negative: reduce_only violation → ReduceOnlyViolation
+- Negative: expired deadline → DeadlineExpired
+- Negative: limit order without price → InvalidRevealData
+- Negative: truncated Borsh → InvalidRevealData
+- Positive: valid limit order, valid market 5
+
+---
+
+## P7: Rate Limiting (M1)
+
+**Statement:** Policy-level rate limiting prevents execution spam.
+
+**Mechanism:**
+- `policy.rate_limit_per_window` and `policy.max_time_window` define the rate limit
+- Minimum interval = `max_time_window / rate_limit_per_window`
+- If `rate_limit_per_window > 0` and `last_executed_at > 0`, elapsed time must be ≥ min interval
+- Setting `rate_limit_per_window = 0` disables rate limiting
+
+**Policy counters updated on execution:**
+- `executed_count` incremented by 1
+- `last_executed_at` set to current unix timestamp
+- `ticket_count` incremented on ticket creation
+
+---
+
+## P8: Events / Receipts (M1)
+
+**Statement:** All ticket lifecycle transitions emit Anchor events for off-chain indexing.
+
+**Events:**
+| Event | Trigger | Fields |
+|-------|---------|--------|
+| `TicketCreated` | `create_ticket` | policy, ticket, owner, ticket_id, expiry, slot |
+| `TicketExecuted` | `execute_ticket` | policy, ticket, keeper, market_index, base_amount, slot |
+| `TicketCancelled` | `cancel_ticket` | ticket, owner, slot |
+| `TicketExpired` | `expire_ticket` | ticket, cranker, slot |
+
+---
+
+## Test Coverage Summary (v0.3)
+
+| Category | Tests | Status |
+|----------|-------|--------|
+| Policy Management | 5 | ✅ |
+| Ticket Lifecycle | 5 | ✅ |
+| Cancel and Expire | 2 | ✅ |
+| Policy-binding | 1 | ✅ |
+| Commitment binding | 2 | ✅ |
+| Payload validation | 14 | ✅ |
+| **Total integration** | **29** | ✅ |
+| Rust unit tests | 24 | ✅ |
