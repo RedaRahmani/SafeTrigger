@@ -46,6 +46,9 @@ pub enum CatalystError {
     #[msg("CPI target program is not an allowed program")]
     DisallowedCpiTarget,
 
+    #[msg("Drift CPI unavailable on this cluster")]
+    DriftCpiUnavailable,
+
     #[msg("Drift instruction discriminator not in allowlist")]
     DisallowedInstruction,
 

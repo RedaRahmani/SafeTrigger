@@ -278,6 +278,48 @@ describe("catalyst_guard", () => {
       revealData = serializePayload(defaultPayload());
     });
 
+    it("rejects create_ticket from non-authority under someone else's policy (owner==policy.authority)", async () => {
+      const impostor = Keypair.generate();
+      const airdropSig = await provider.connection.requestAirdrop(
+        impostor.publicKey,
+        2_000_000_000
+      );
+      await provider.connection.confirmTransaction(airdropSig);
+
+      const ticketIdX = randomBytes(32);
+      const secretSaltX = randomBytes(32);
+      const revealDataX = serializePayload(defaultPayload());
+      const commitmentX = createCommitment(
+        impostor.publicKey,
+        policyPDA,
+        ticketIdX,
+        secretSaltX,
+        revealDataX
+      );
+      const now = Math.floor(Date.now() / 1000);
+      const [ticketPDAX] = findTicketPDA(program.programId, policyPDA, ticketIdX);
+
+      try {
+        await program.methods
+          .createTicket(
+            Array.from(commitmentX) as any,
+            Array.from(ticketIdX) as any,
+            new anchor.BN(now + 3600)
+          )
+          .accounts({
+            ticket: ticketPDAX,
+            policy: policyPDA,
+            owner: impostor.publicKey,
+            systemProgram: SystemProgram.programId,
+          })
+          .signers([impostor])
+          .rpc();
+        expect.fail("Should have thrown – unauthorized ticket owner");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("Unauthorized");
+      }
+    });
+
     it("creates a ticket with commitment hash", async () => {
       commitment = createCommitment(
         authority.publicKey,
@@ -328,28 +370,7 @@ describe("catalyst_guard", () => {
       expect(ticketAccount).to.not.have.property("direction");
     });
 
-    it("executes a ticket with valid reveal (P2 + P3 + policy validation)", async () => {
-      const tx = await program.methods
-        .executeTicket(Array.from(secretSalt) as any, revealData)
-        .accounts({
-          ticket: ticketPDA,
-          policy: policyPDA,
-          keeper: authority.publicKey,
-        })
-        .rpc();
-
-      console.log("  executeTicket tx:", tx);
-
-      const ticketAccount = await program.account.ticket.fetch(ticketPDA);
-      expect(ticketAccount.status).to.deep.equal({ executed: {} });
-      expect(ticketAccount.executedSlot.toNumber()).to.be.greaterThan(0);
-
-      // Verify policy counters were updated
-      const policyAccount = await program.account.policy.fetch(policyPDA);
-      expect(policyAccount.executedCount.toNumber()).to.be.greaterThan(0);
-    });
-
-    it("P3: replay protection – cannot execute consumed ticket", async () => {
+    it("atomicity: valid reveal does not consume ticket when Drift CPI is unavailable", async () => {
       try {
         await program.methods
           .executeTicket(Array.from(secretSalt) as any, revealData)
@@ -359,10 +380,37 @@ describe("catalyst_guard", () => {
             keeper: authority.publicKey,
           })
           .rpc();
-        expect.fail("Should have thrown – ticket already consumed");
+        expect.fail("Should have thrown – Drift CPI unavailable");
       } catch (err: any) {
-        expect(err.toString()).to.contain("TicketAlreadyConsumed");
+        expect(err.toString()).to.contain("DriftCpiUnavailable");
       }
+
+      const ticketAccount = await program.account.ticket.fetch(ticketPDA);
+      expect(ticketAccount.status).to.deep.equal({ open: {} });
+      expect(ticketAccount.executedSlot.toNumber()).to.equal(0);
+
+      const policyAccount = await program.account.policy.fetch(policyPDA);
+      expect(policyAccount.executedCount.toNumber()).to.equal(0);
+    });
+
+    it("atomicity: repeated execute attempts still fail and ticket remains Open", async () => {
+      try {
+        await program.methods
+          .executeTicket(Array.from(secretSalt) as any, revealData)
+          .accounts({
+            ticket: ticketPDA,
+            policy: policyPDA,
+            keeper: authority.publicKey,
+          })
+          .rpc();
+        expect.fail("Should have thrown – Drift CPI unavailable");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("DriftCpiUnavailable");
+      }
+
+      const ticketAccount = await program.account.ticket.fetch(ticketPDA);
+      expect(ticketAccount.status).to.deep.equal({ open: {} });
+      expect(ticketAccount.executedSlot.toNumber()).to.equal(0);
     });
 
     it("rejects execution with wrong reveal data (P2)", async () => {
@@ -668,23 +716,26 @@ describe("catalyst_guard", () => {
       }
     });
 
-    it("succeeds with correct salt and reveal data", async () => {
-      const tx = await program.methods
-        .executeTicket(
-          Array.from(commitSecretSalt) as any,
-          commitRevealData
-        )
-        .accounts({
-          ticket: commitTicketPDA,
-          policy: policyPDA,
-          keeper: authority.publicKey,
-        })
-        .rpc();
+    it("atomicity: correct salt + reveal validates but still fails without Drift CPI", async () => {
+      try {
+        await program.methods
+          .executeTicket(
+            Array.from(commitSecretSalt) as any,
+            commitRevealData
+          )
+          .accounts({
+            ticket: commitTicketPDA,
+            policy: policyPDA,
+            keeper: authority.publicKey,
+          })
+          .rpc();
+        expect.fail("Should have thrown – Drift CPI unavailable");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("DriftCpiUnavailable");
+      }
 
-      const ticketAccount = await program.account.ticket.fetch(
-        commitTicketPDA
-      );
-      expect(ticketAccount.status).to.deep.equal({ executed: {} });
+      const ticketAccount = await program.account.ticket.fetch(commitTicketPDA);
+      expect(ticketAccount.status).to.deep.equal({ open: {} });
     });
   });
 
@@ -801,16 +852,24 @@ describe("catalyst_guard", () => {
       payload.orderType = OrderType.Limit;
       payload.limitPrice = BigInt(155_000_000);
 
-      const tx = await createAndExecute(payload);
-      expect(tx).to.be.a("string");
+      try {
+        await createAndExecute(payload);
+        expect.fail("Should have thrown – Drift CPI unavailable");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("DriftCpiUnavailable");
+      }
     });
 
     it("accepts payload on allowed market index 5", async () => {
       const payload = defaultPayload();
       payload.marketIndex = 5;
 
-      const tx = await createAndExecute(payload);
-      expect(tx).to.be.a("string");
+      try {
+        await createAndExecute(payload);
+        expect.fail("Should have thrown – Drift CPI unavailable");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("DriftCpiUnavailable");
+      }
     });
 
     it("rejects invalid Borsh (truncated payload)", async () => {

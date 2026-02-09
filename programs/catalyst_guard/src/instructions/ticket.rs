@@ -4,7 +4,7 @@ use anchor_lang::prelude::*;
 use sha2::{Digest, Sha256};
 
 use crate::error::CatalystError;
-use crate::events::{TicketCancelled, TicketCreated, TicketExecuted, TicketExpired};
+use crate::events::{TicketCancelled, TicketCreated, TicketExpired};
 use crate::state::payload::HedgePayloadV1;
 use crate::state::policy::{Policy, POLICY_SEED};
 use crate::state::ticket::*;
@@ -19,13 +19,13 @@ pub const MAX_EXPIRY_WINDOW: i64 = 7 * 24 * 60 * 60;
 // ── CreateTicket ────────────────────────────────────────────────
 
 #[derive(Accounts)]
-#[instruction(commitment: [u8; 32], nonce: [u8; 32])]
+#[instruction(commitment: [u8; 32], ticket_id: [u8; 32])]
 pub struct CreateTicket<'info> {
     #[account(
         init,
         payer = owner,
         space = Ticket::SPACE,
-        seeds = [TICKET_SEED, policy.key().as_ref(), &nonce],
+        seeds = [TICKET_SEED, policy.key().as_ref(), &ticket_id],
         bump,
     )]
     pub ticket: Account<'info, Ticket>,
@@ -33,6 +33,7 @@ pub struct CreateTicket<'info> {
     #[account(
         mut,
         constraint = !policy.paused @ CatalystError::PolicyPaused,
+        constraint = policy.authority == owner.key() @ CatalystError::Unauthorized,
     )]
     pub policy: Account<'info, Policy>,
 
@@ -192,8 +193,8 @@ pub fn handle_execute_ticket(
     secret_salt: [u8; 32],
     revealed_data: Vec<u8>,
 ) -> Result<()> {
-    let ticket = &mut ctx.accounts.ticket;
-    let policy = &mut ctx.accounts.policy;
+    let ticket = &ctx.accounts.ticket;
+    let policy = &ctx.accounts.policy;
     let clock = Clock::get()?;
 
     // ── P2: Verify commitment (domain-separated, owner/policy-bound) ──
@@ -239,19 +240,6 @@ pub fn handle_execute_ticket(
         require!(elapsed >= min_interval, CatalystError::RateLimitExceeded);
     }
 
-    // ── P3: Mark as consumed (replay protection) ────────────────
-    ticket.status = TicketStatus::Executed;
-    ticket.executed_slot = clock.slot;
-    ticket.updated_at = clock.unix_timestamp;
-
-    // ── Update policy counters ──────────────────────────────────
-    policy.executed_count = policy
-        .executed_count
-        .checked_add(1)
-        .ok_or(CatalystError::MathOverflow)?;
-    policy.last_executed_at = clock.unix_timestamp;
-    policy.updated_at = clock.unix_timestamp;
-
     // ── P4: Drift CPI firewall ────────────────────────────────────
     // Build BoundedOrderParams from the validated payload.
     // This conversion happens AFTER policy validation, ensuring all
@@ -276,26 +264,7 @@ pub fn handle_execute_ticket(
     let _cpi_data = build_place_perp_order_data(&order_params);
 
     // NOTE: Actual CPI invoke is gated on Drift being deployed.
-    // On localnet (no Drift), we validate and log. On devnet/mainnet,
-    // the ExecuteTicket accounts struct will include Drift accounts
-    // and invoke_signed will be called here.
-    msg!(
-        "Ticket executed: market={}, side={:?}, amount={}, price={}, slot={}",
-        order_params.market_index,
-        order_params.direction,
-        order_params.base_asset_amount,
-        order_params.price,
-        clock.slot
-    );
-
-    emit!(TicketExecuted {
-        policy: ticket.policy,
-        ticket: ticket.key(),
-        keeper: ctx.accounts.keeper.key(),
-        market_index: payload.market_index,
-        base_amount: payload.base_amount,
-        slot: clock.slot,
-    });
-
-    Ok(())
+    // On localnet (no Drift), we MUST NOT consume the ticket or pretend success.
+    // Return an explicit error so clients/tests can gate execution until CPI is available.
+    Err(error!(CatalystError::DriftCpiUnavailable))
 }
