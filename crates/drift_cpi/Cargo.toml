@@ -1,0 +1,11 @@
+[package]
+name = "drift_cpi"
+version = "0.2.0"
+description = "Pinned Drift CPI instruction builders and constants for CatalystGuard"
+edition = "2021"
+license = "BUSL-1.1"
+
+[dependencies]
+anchor-lang = { workspace = true }
+solana-program = { workspace = true }
+borsh = { workspace = true }

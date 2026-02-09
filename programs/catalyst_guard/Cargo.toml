@@ -1,0 +1,26 @@
+[package]
+name = "catalyst_guard"
+version = "0.2.0"
+description = "Sealed conditional intent + PDA capability firewall for Solana perps hedging"
+edition = "2021"
+license = "BUSL-1.1"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "catalyst_guard"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build"]
+
+[dependencies]
+anchor-lang = { workspace = true }
+drift_cpi = { path = "../../crates/drift_cpi" }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+solana-program = { workspace = true }
