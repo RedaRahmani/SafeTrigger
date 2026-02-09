@@ -82,6 +82,10 @@ impl Policy {
         + 8 // updated_at
     }
 
+    /// Fixed space: always allocates for MAX_ALLOWED_MARKETS so that
+    /// update_policy can grow allowed_markets without realloc.
+    pub const FIXED_SPACE: usize = Self::space(MAX_ALLOWED_MARKETS);
+
     /// Is the given market index allowed by this policy?
     pub fn is_market_allowed(&self, market_index: u16) -> bool {
         self.allowed_markets.contains(&market_index)
@@ -102,6 +106,11 @@ mod tests {
         let space_max = Policy::space(MAX_ALLOWED_MARKETS);
         assert!(space_max > space_0);
         assert_eq!(space_max - space_0, MAX_ALLOWED_MARKETS * 2);
+    }
+
+    #[test]
+    fn test_fixed_space_equals_max() {
+        assert_eq!(Policy::FIXED_SPACE, Policy::space(MAX_ALLOWED_MARKETS));
     }
 
     #[test]

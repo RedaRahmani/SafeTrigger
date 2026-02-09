@@ -10,12 +10,11 @@ use crate::state::policy::*;
 // ── InitPolicy ──────────────────────────────────────────────────
 
 #[derive(Accounts)]
-#[instruction(allowed_markets: Vec<u16>)]
 pub struct InitPolicy<'info> {
     #[account(
         init,
         payer = authority,
-        space = Policy::space(allowed_markets.len()),
+        space = Policy::FIXED_SPACE,
         seeds = [POLICY_SEED, authority.key().as_ref(), drift_sub_account.key().as_ref()],
         bump,
     )]

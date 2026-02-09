@@ -176,6 +176,24 @@ describe("catalyst_guard", () => {
         expect(err).to.exist;
       }
     });
+
+    it("rejects update_policy with more than 32 markets (TooManyMarkets)", async () => {
+      // Create an array of 33 market indices
+      const tooManyMarkets = Array.from({ length: 33 }, (_, i) => i);
+
+      try {
+        await program.methods
+          .updatePolicy(tooManyMarkets, null, null, null)
+          .accounts({
+            policy: policyPDA,
+            authority: authority.publicKey,
+          })
+          .rpc();
+        expect.fail("Should have thrown – too many markets");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("TooManyMarkets");
+      }
+    });
   });
 
   // ── Ticket Tests ────────────────────────────────────────────
