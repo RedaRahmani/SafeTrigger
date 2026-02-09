@@ -61,9 +61,18 @@ impl Default for KeeperConfig {
             rpc_url: "http://localhost:8899".to_string(),
             poll_interval_secs: 5,
             mock_oracle_prices: vec![
-                MockOraclePrice { market_index: 0, price: 160_000_000 },
-                MockOraclePrice { market_index: 1, price: 3_500_000_000 },
-                MockOraclePrice { market_index: 5, price: 95_000_000_000 },
+                MockOraclePrice {
+                    market_index: 0,
+                    price: 160_000_000,
+                },
+                MockOraclePrice {
+                    market_index: 1,
+                    price: 3_500_000_000,
+                },
+                MockOraclePrice {
+                    market_index: 5,
+                    price: 95_000_000_000,
+                },
             ],
         }
     }
@@ -73,15 +82,24 @@ impl Default for KeeperConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
-pub enum TriggerDirection { Above = 0, Below = 1 }
+pub enum TriggerDirection {
+    Above = 0,
+    Below = 1,
+}
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
-pub enum PositionDirection { Long = 0, Short = 1 }
+pub enum PositionDirection {
+    Long = 0,
+    Short = 1,
+}
 
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
-pub enum OrderType { Market = 0, Limit = 1 }
+pub enum OrderType {
+    Market = 0,
+    Limit = 1,
+}
 
 #[derive(Debug, Clone)]
 pub struct HedgePayloadV1 {
@@ -107,30 +125,58 @@ impl HedgePayloadV1 {
         let market_index = u16::from_le_bytes(r(data, o, 2)?.try_into().unwrap());
         o += 2;
         let trigger_direction = match *data.get(o).ok_or("truncated")? {
-            0 => TriggerDirection::Above, 1 => TriggerDirection::Below,
+            0 => TriggerDirection::Above,
+            1 => TriggerDirection::Below,
             v => return Err(format!("bad trigger_direction: {v}")),
-        }; o += 1;
-        let trigger_price = u64::from_le_bytes(r(data, o, 8)?.try_into().unwrap()); o += 8;
+        };
+        o += 1;
+        let trigger_price = u64::from_le_bytes(r(data, o, 8)?.try_into().unwrap());
+        o += 8;
         let side = match *data.get(o).ok_or("truncated")? {
-            0 => PositionDirection::Long, 1 => PositionDirection::Short,
+            0 => PositionDirection::Long,
+            1 => PositionDirection::Short,
             v => return Err(format!("bad side: {v}")),
-        }; o += 1;
-        let base_amount = u64::from_le_bytes(r(data, o, 8)?.try_into().unwrap()); o += 8;
-        let reduce_only = *data.get(o).ok_or("truncated")? != 0; o += 1;
+        };
+        o += 1;
+        let base_amount = u64::from_le_bytes(r(data, o, 8)?.try_into().unwrap());
+        o += 8;
+        let reduce_only = *data.get(o).ok_or("truncated")? != 0;
+        o += 1;
         let order_type = match *data.get(o).ok_or("truncated")? {
-            0 => OrderType::Market, 1 => OrderType::Limit,
+            0 => OrderType::Market,
+            1 => OrderType::Limit,
             v => return Err(format!("bad order_type: {v}")),
-        }; o += 1;
+        };
+        o += 1;
         let limit_price = match *data.get(o).ok_or("truncated")? {
-            0 => { o += 1; None }
-            1 => { o += 1; let p = u64::from_le_bytes(r(data, o, 8)?.try_into().unwrap()); o += 8; Some(p) }
+            0 => {
+                o += 1;
+                None
+            }
+            1 => {
+                o += 1;
+                let p = u64::from_le_bytes(r(data, o, 8)?.try_into().unwrap());
+                o += 8;
+                Some(p)
+            }
             v => return Err(format!("bad Option tag: {v}")),
         };
-        let max_slippage_bps = u16::from_le_bytes(r(data, o, 2)?.try_into().unwrap()); o += 2;
+        let max_slippage_bps = u16::from_le_bytes(r(data, o, 2)?.try_into().unwrap());
+        o += 2;
         let deadline_ts = i64::from_le_bytes(r(data, o, 8)?.try_into().unwrap());
 
-        Ok(Self { market_index, trigger_direction, trigger_price, side, base_amount,
-                  reduce_only, order_type, limit_price, max_slippage_bps, deadline_ts })
+        Ok(Self {
+            market_index,
+            trigger_direction,
+            trigger_price,
+            side,
+            base_amount,
+            reduce_only,
+            order_type,
+            limit_price,
+            max_slippage_bps,
+            deadline_ts,
+        })
     }
 
     pub fn is_trigger_met(&self, oracle_price: u64) -> bool {
@@ -144,13 +190,18 @@ impl HedgePayloadV1 {
 // ── Commitment ──────────────────────────────────────────────────
 
 pub fn compute_commitment(
-    owner: &[u8; 32], policy: &[u8; 32], ticket_id: &[u8; 32],
-    secret_salt: &[u8; 32], revealed_data: &[u8],
+    owner: &[u8; 32],
+    policy: &[u8; 32],
+    ticket_id: &[u8; 32],
+    secret_salt: &[u8; 32],
+    revealed_data: &[u8],
 ) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(COMMITMENT_DOMAIN);
-    h.update(owner); h.update(policy);
-    h.update(ticket_id); h.update(secret_salt);
+    h.update(owner);
+    h.update(policy);
+    h.update(ticket_id);
+    h.update(secret_salt);
     h.update(revealed_data);
     h.finalize().into()
 }
@@ -171,23 +222,38 @@ pub struct ParsedTicket {
 impl ParsedTicket {
     pub fn from_account_data(data: &[u8]) -> Result<Self, String> {
         if data.len() < TICKET_DATA_LEN as usize {
-            return Err(format!("account data too short: {} < {}", data.len(), TICKET_DATA_LEN));
+            return Err(format!(
+                "account data too short: {} < {}",
+                data.len(),
+                TICKET_DATA_LEN
+            ));
         }
         let mut o = 8; // skip discriminator
         let read32 = |d: &[u8], off: &mut usize| -> [u8; 32] {
             let mut buf = [0u8; 32];
             buf.copy_from_slice(&d[*off..*off + 32]);
-            *off += 32; buf
+            *off += 32;
+            buf
         };
         let owner = read32(data, &mut o);
         let policy = read32(data, &mut o);
         let commitment = read32(data, &mut o);
         let ticket_id = read32(data, &mut o);
-        let bump = data[o]; o += 1;
-        let status = data[o]; o += 1;
-        let expiry = i64::from_le_bytes(data[o..o+8].try_into().unwrap());
+        let bump = data[o];
+        o += 1;
+        let status = data[o];
+        o += 1;
+        let expiry = i64::from_le_bytes(data[o..o + 8].try_into().unwrap());
 
-        Ok(Self { owner, policy, commitment, ticket_id, bump, status, expiry })
+        Ok(Self {
+            owner,
+            policy,
+            commitment,
+            ticket_id,
+            bump,
+            status,
+            expiry,
+        })
     }
 }
 
@@ -208,10 +274,12 @@ struct RpcResponse {
 }
 
 async fn get_program_accounts(
-    client: &reqwest::Client, rpc_url: &str,
+    client: &reqwest::Client,
+    rpc_url: &str,
 ) -> Result<Vec<(String, Vec<u8>)>, Box<dyn std::error::Error>> {
     let request = RpcRequest {
-        jsonrpc: "2.0", id: 1,
+        jsonrpc: "2.0",
+        id: 1,
         method: "getProgramAccounts",
         params: serde_json::json!([
             PROGRAM_ID,
@@ -225,9 +293,13 @@ async fn get_program_accounts(
         ]),
     };
 
-    let resp: RpcResponse = client.post(rpc_url)
-        .json(&request).send().await?
-        .json().await?;
+    let resp: RpcResponse = client
+        .post(rpc_url)
+        .json(&request)
+        .send()
+        .await?
+        .json()
+        .await?;
 
     if let Some(err) = resp.error {
         return Err(format!("RPC error: {}", err).into());
@@ -266,14 +338,22 @@ async fn main() {
     info!("CatalystGuard Keeper v0.3 MVP starting...");
 
     let config = load_config();
-    info!("RPC={}, poll={}s, oracles={}", config.rpc_url, config.poll_interval_secs, config.mock_oracle_prices.len());
+    info!(
+        "RPC={}, poll={}s, oracles={}",
+        config.rpc_url,
+        config.poll_interval_secs,
+        config.mock_oracle_prices.len()
+    );
 
     let client = reqwest::Client::new();
 
     // Verify RPC connectivity
     match check_rpc(&client, &config.rpc_url).await {
         Ok(version) => info!("Connected to Solana: {}", version),
-        Err(e) => { error!("RPC connection failed: {}", e); std::process::exit(1); }
+        Err(e) => {
+            error!("RPC connection failed: {}", e);
+            std::process::exit(1);
+        }
     }
 
     info!("Monitoring program: {}", PROGRAM_ID);
@@ -293,11 +373,15 @@ async fn main() {
                         Ok(ticket) => {
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap().as_secs() as i64;
+                                .unwrap()
+                                .as_secs() as i64;
                             let expired = now >= ticket.expiry;
                             info!(
                                 "  Ticket {} | status={} | expiry={} | expired={}",
-                                &pubkey[..8], ticket.status, ticket.expiry, expired
+                                &pubkey[..8],
+                                ticket.status,
+                                ticket.expiry,
+                                expired
                             );
                             // In production: look up secret from off-chain DB,
                             // deserialize payload, check oracle, submit tx.
@@ -326,11 +410,22 @@ fn load_config() -> KeeperConfig {
     KeeperConfig::default()
 }
 
-async fn check_rpc(client: &reqwest::Client, url: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let req = RpcRequest { jsonrpc: "2.0", id: 1, method: "getVersion", params: serde_json::json!([]) };
+async fn check_rpc(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let req = RpcRequest {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "getVersion",
+        params: serde_json::json!([]),
+    };
     let resp: RpcResponse = client.post(url).json(&req).send().await?.json().await?;
     let version = resp.result.unwrap_or_default();
-    Ok(version["solana-core"].as_str().unwrap_or("unknown").to_string())
+    Ok(version["solana-core"]
+        .as_str()
+        .unwrap_or("unknown")
+        .to_string())
 }
 
 // ── Tests ───────────────────────────────────────────────────────
@@ -368,8 +463,11 @@ mod tests {
         buf.extend_from_slice(&0u16.to_le_bytes());
         buf.push(0);
         buf.extend_from_slice(&150_000_000u64.to_le_bytes());
-        buf.push(0); buf.extend_from_slice(&1_000_000_000u64.to_le_bytes());
-        buf.push(0); buf.push(0); buf.push(0);
+        buf.push(0);
+        buf.extend_from_slice(&1_000_000_000u64.to_le_bytes());
+        buf.push(0);
+        buf.push(0);
+        buf.push(0);
         buf.extend_from_slice(&50u16.to_le_bytes());
         buf.extend_from_slice(&2_000_000_000i64.to_le_bytes());
 
