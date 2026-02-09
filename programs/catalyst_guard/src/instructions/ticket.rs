@@ -4,6 +4,7 @@ use anchor_lang::prelude::*;
 use sha2::{Digest, Sha256};
 
 use crate::error::CatalystError;
+use crate::events::{TicketCancelled, TicketCreated, TicketExecuted, TicketExpired};
 use crate::state::payload::HedgePayloadV1;
 use crate::state::policy::{Policy, POLICY_SEED};
 use crate::state::ticket::*;
@@ -84,6 +85,16 @@ pub fn handle_create_ticket(
         &commitment[..8],
         expiry
     );
+
+    emit!(TicketCreated {
+        policy: ctx.accounts.policy.key(),
+        ticket: ctx.accounts.ticket.key(),
+        owner: ctx.accounts.owner.key(),
+        ticket_id,
+        expiry,
+        slot: clock.slot,
+    });
+
     Ok(())
 }
 
@@ -107,6 +118,12 @@ pub fn handle_cancel_ticket(ctx: Context<CancelTicket>) -> Result<()> {
 
     ticket.status = TicketStatus::Cancelled;
     ticket.updated_at = clock.unix_timestamp;
+
+    emit!(TicketCancelled {
+        ticket: ctx.accounts.ticket.key(),
+        owner: ctx.accounts.owner.key(),
+        slot: clock.slot,
+    });
 
     msg!("Ticket cancelled");
     Ok(())
@@ -133,6 +150,12 @@ pub fn handle_expire_ticket(ctx: Context<ExpireTicket>) -> Result<()> {
 
     ticket.status = TicketStatus::Expired;
     ticket.updated_at = clock.unix_timestamp;
+
+    emit!(TicketExpired {
+        ticket: ctx.accounts.ticket.key(),
+        cranker: ctx.accounts.cranker.key(),
+        slot: clock.slot,
+    });
 
     msg!("Ticket expired");
     Ok(())
@@ -264,6 +287,15 @@ pub fn handle_execute_ticket(
         order_params.price,
         clock.slot
     );
+
+    emit!(TicketExecuted {
+        policy: ticket.policy,
+        ticket: ticket.key(),
+        keeper: ctx.accounts.keeper.key(),
+        market_index: payload.market_index,
+        base_amount: payload.base_amount,
+        slot: clock.slot,
+    });
 
     Ok(())
 }
