@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "programs/catalyst_guard",
+    "programs/drift_stub",
     "programs/test_oracle",
     "crates/drift_cpi",
     "services/keeper",

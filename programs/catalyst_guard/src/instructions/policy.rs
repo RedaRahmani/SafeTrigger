@@ -53,6 +53,19 @@ pub fn handle_init_policy(
         CatalystError::InvalidTimeWindow
     );
 
+    // MVP: require policy points at Drift sub-account PDA for sub_account_id=0.
+    // This enables deterministic CPI account validation in execute_ticket.
+    let (expected_drift_user, _) =
+        drift_cpi::derive_drift_user_pda(&ctx.accounts.authority.key(), 0);
+    require!(
+        ctx.accounts.drift_sub_account.key() == expected_drift_user,
+        CatalystError::InvalidDriftUser
+    );
+    require!(
+        *ctx.accounts.drift_sub_account.to_account_info().owner == drift_cpi::DRIFT_PROGRAM_ID,
+        CatalystError::InvalidDriftUser
+    );
+
     let clock = Clock::get()?;
     let policy = &mut ctx.accounts.policy;
 

@@ -55,6 +55,24 @@ pub enum CatalystError {
     #[msg("Order params violate policy bounds")]
     OrderParamsViolation,
 
+    #[msg("Invalid Drift program account")]
+    InvalidDriftProgram,
+
+    #[msg("Invalid Drift state account")]
+    InvalidDriftState,
+
+    #[msg("Invalid Drift user (sub-account)")]
+    InvalidDriftUser,
+
+    #[msg("Invalid Drift user stats account")]
+    InvalidDriftUserStats,
+
+    #[msg("Invalid Drift spot market account")]
+    InvalidDriftSpotMarket,
+
+    #[msg("Invalid Drift perp market account")]
+    InvalidDriftPerpMarket,
+
     // ── Payload / predicate errors ──────────────────────────────
     #[msg("Market index not in policy allowlist")]
     MarketNotAllowed,

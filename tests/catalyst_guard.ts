@@ -1,16 +1,74 @@
-import * as anchor from "@coral-xyz/anchor";
+import anchor from "@coral-xyz/anchor";
 import { Program } from "@coral-xyz/anchor";
-import { CatalystGuard } from "../target/types/catalyst_guard";
-import { TestOracle } from "../target/types/test_oracle";
 import { Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
 import { createHash, randomBytes } from "crypto";
 import { expect } from "chai";
+import { readFileSync } from "fs";
+import { fileURLToPath } from "url";
+import path from "path";
 
 // ── Constants ───────────────────────────────────────────────────
 
 const POLICY_SEED = Buffer.from("policy");
 const TICKET_SEED = Buffer.from("ticket");
 const COMMITMENT_DOMAIN = Buffer.from("CSv0.2");
+
+// Drift (pinned program id + PDA seeds)
+const DRIFT_PROGRAM_ID = new PublicKey(
+  "dRiftyHA39MWEi3m9aunc5MzRF1JYuBsbn6VPcn33UH"
+);
+const DRIFT_STATE_SEED = Buffer.from("drift_state");
+const DRIFT_USER_SEED = Buffer.from("user");
+const DRIFT_USER_STATS_SEED = Buffer.from("user_stats");
+const DRIFT_SPOT_MARKET_SEED = Buffer.from("spot_market");
+const DRIFT_PERP_MARKET_SEED = Buffer.from("perp_market");
+const DRIFT_SUB_ACCOUNT_ID = 0; // MVP: only sub-account 0
+const ZERO_PUBKEY = new PublicKey(new Uint8Array(32));
+
+function u16LE(n: number): Buffer {
+  const b = Buffer.alloc(2);
+  b.writeUInt16LE(n, 0);
+  return b;
+}
+
+function loadIdl(name: string): any {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = path.dirname(__filename);
+  const idlPath = path.join(__dirname, "..", "target", "idl", `${name}.json`);
+  return JSON.parse(readFileSync(idlPath, "utf8"));
+}
+
+function findDriftStatePDA(): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync([DRIFT_STATE_SEED], DRIFT_PROGRAM_ID);
+}
+
+function findDriftUserPDA(authority: PublicKey, subAccountId: number): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [DRIFT_USER_SEED, authority.toBuffer(), u16LE(subAccountId)],
+    DRIFT_PROGRAM_ID
+  );
+}
+
+function findDriftUserStatsPDA(authority: PublicKey): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [DRIFT_USER_STATS_SEED, authority.toBuffer()],
+    DRIFT_PROGRAM_ID
+  );
+}
+
+function findDriftSpotMarketPDA(marketIndex: number): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [DRIFT_SPOT_MARKET_SEED, u16LE(marketIndex)],
+    DRIFT_PROGRAM_ID
+  );
+}
+
+function findDriftPerpMarketPDA(marketIndex: number): [PublicKey, number] {
+  return PublicKey.findProgramAddressSync(
+    [DRIFT_PERP_MARKET_SEED, u16LE(marketIndex)],
+    DRIFT_PROGRAM_ID
+  );
+}
 
 // ── Enums as plain constants (TS enums not supported in strip-only mode) ──
 
@@ -159,15 +217,23 @@ describe("catalyst_guard", () => {
   const provider = anchor.AnchorProvider.env();
   anchor.setProvider(provider);
 
-  const program = anchor.workspace.catalystGuard as Program<CatalystGuard>;
-  const oracleProgram = anchor.workspace.testOracle as Program<TestOracle>;
+  const program = anchor.workspace.catalystGuard as Program;
+  const oracleProgram = anchor.workspace.testOracle as Program;
   const authority = provider.wallet;
-  const driftSubAccount = Keypair.generate();
 
   let oracleFeed: Keypair;
 
   let policyPDA: PublicKey;
   let policyBump: number;
+
+  // Drift stub program + PDAs (loaded at DRIFT_PROGRAM_ID via genesis)
+  let driftStub: Program;
+  let driftStatePDA: PublicKey;
+  let driftUserPDA: PublicKey;
+  let driftUserStatsPDA: PublicKey;
+  let driftSpotMarketPDA: PublicKey;
+  let driftPerpMarket0PDA: PublicKey;
+  let driftPerpMarket5PDA: PublicKey;
 
   // ── Policy Tests ────────────────────────────────────────────
 
@@ -192,6 +258,84 @@ describe("catalyst_guard", () => {
       console.log("  initFeed tx:", tx);
     });
 
+    it("initializes drift stub accounts (state/user/markets)", async () => {
+      // Load the local IDL so we can call the stub program that is loaded at genesis.
+      const driftIdl = loadIdl("drift_stub");
+      // Anchor v0.31 Program derives the program id from `idl.address`.
+      // Our drift stub is loaded at the pinned Drift program id via validator genesis,
+      // so overwrite the IDL address before constructing the client.
+      driftIdl.address = DRIFT_PROGRAM_ID.toBase58();
+      driftStub = new Program(driftIdl, provider);
+
+      [driftStatePDA] = findDriftStatePDA();
+      [driftUserPDA] = findDriftUserPDA(authority.publicKey, DRIFT_SUB_ACCOUNT_ID);
+      [driftUserStatsPDA] = findDriftUserStatsPDA(authority.publicKey);
+      [driftSpotMarketPDA] = findDriftSpotMarketPDA(0);
+      [driftPerpMarket0PDA] = findDriftPerpMarketPDA(0);
+      [driftPerpMarket5PDA] = findDriftPerpMarketPDA(5);
+
+      const tx1 = await driftStub.methods
+        .initState()
+        .accounts({
+          state: driftStatePDA,
+          admin: authority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+      console.log("  initDriftState tx:", tx1);
+
+      const tx2 = await driftStub.methods
+        .initUser(DRIFT_SUB_ACCOUNT_ID)
+        .accounts({
+          user: driftUserPDA,
+          authority: authority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+      console.log("  initDriftUser tx:", tx2);
+
+      const tx3 = await driftStub.methods
+        .initUserStats()
+        .accounts({
+          userStats: driftUserStatsPDA,
+          authority: authority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+      console.log("  initDriftUserStats tx:", tx3);
+
+      const tx4 = await driftStub.methods
+        .initSpotMarket(0, ZERO_PUBKEY)
+        .accounts({
+          spotMarket: driftSpotMarketPDA,
+          admin: authority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+      console.log("  initDriftSpotMarket0 tx:", tx4);
+
+      // Initialize perp markets used by tests. Both point at the same oracle feed for simplicity.
+      const tx5 = await driftStub.methods
+        .initPerpMarket(0, oracleFeedPubkey)
+        .accounts({
+          perpMarket: driftPerpMarket0PDA,
+          admin: authority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+      console.log("  initDriftPerpMarket0 tx:", tx5);
+
+      const tx6 = await driftStub.methods
+        .initPerpMarket(5, oracleFeedPubkey)
+        .accounts({
+          perpMarket: driftPerpMarket5PDA,
+          admin: authority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+      console.log("  initDriftPerpMarket5 tx:", tx6);
+    });
+
     it("initializes a policy", async () => {
       const allowedMarkets = [0, 1, 5];
       const maxBaseAmount = new anchor.BN(1_000_000_000);
@@ -204,7 +348,7 @@ describe("catalyst_guard", () => {
       [policyPDA, policyBump] = findPolicyPDA(
         program.programId,
         authority.publicKey,
-        driftSubAccount.publicKey
+        driftUserPDA
       );
 
       const tx = await program.methods
@@ -220,7 +364,7 @@ describe("catalyst_guard", () => {
         .accounts({
           policy: policyPDA,
           authority: authority.publicKey,
-          driftSubAccount: driftSubAccount.publicKey,
+          driftSubAccount: driftUserPDA,
           systemProgram: SystemProgram.programId,
         })
         .rpc();
@@ -236,6 +380,16 @@ describe("catalyst_guard", () => {
       expect(policyAccount.maxBaseAmount.toNumber()).to.equal(1_000_000_000);
       expect(policyAccount.oracleDeviationBps).to.equal(100);
       expect(policyAccount.reduceOnly).to.be.false;
+
+      // Configure Drift user delegate = Policy PDA so CatalystGuard can sign CPIs.
+      const txDel = await driftStub.methods
+        .updateUserDelegate(policyPDA)
+        .accounts({
+          user: driftUserPDA,
+          authority: authority.publicKey,
+        })
+        .rpc();
+      console.log("  updateDriftUserDelegate tx:", txDel);
     });
 
     it("updates a policy", async () => {
@@ -420,7 +574,7 @@ describe("catalyst_guard", () => {
       expect(ticketAccount).to.not.have.property("direction");
     });
 
-    it("atomicity: valid reveal does not consume ticket when Drift CPI is unavailable", async () => {
+    it("executes a ticket end-to-end (commitment + predicate + Drift CPI) and consumes it", async () => {
       const slot = await provider.connection.getSlot();
       await oracleProgram.methods
         .setFeed(new anchor.BN(160_000_000), new anchor.BN(slot))
@@ -430,30 +584,32 @@ describe("catalyst_guard", () => {
         })
         .rpc();
 
-      try {
-        await program.methods
-          .executeTicket(Array.from(secretSalt) as any, revealData)
-          .accounts({
-            ticket: ticketPDA,
-            policy: policyPDA,
-            keeper: authority.publicKey,
-            oracle: oracleFeed.publicKey,
-          })
-          .rpc();
-        expect.fail("Should have thrown – Drift CPI unavailable");
-      } catch (err: any) {
-        expect(err.toString()).to.contain("DriftCpiUnavailable");
-      }
+      const tx = await program.methods
+        .executeTicket(Array.from(secretSalt) as any, revealData)
+        .accounts({
+          ticket: ticketPDA,
+          policy: policyPDA,
+          keeper: authority.publicKey,
+          oracle: oracleFeed.publicKey,
+          driftProgram: DRIFT_PROGRAM_ID,
+          driftState: driftStatePDA,
+          driftUser: driftUserPDA,
+          driftUserStats: driftUserStatsPDA,
+          driftSpotMarket: driftSpotMarketPDA,
+          driftPerpMarket: driftPerpMarket0PDA,
+        })
+        .rpc();
+      expect(tx).to.exist;
 
       const ticketAccount = await program.account.ticket.fetch(ticketPDA);
-      expect(ticketAccount.status).to.deep.equal({ open: {} });
-      expect(ticketAccount.executedSlot.toNumber()).to.equal(0);
+      expect(ticketAccount.status).to.deep.equal({ executed: {} });
+      expect(ticketAccount.executedSlot.toNumber()).to.be.greaterThan(0);
 
       const policyAccount = await program.account.policy.fetch(policyPDA);
-      expect(policyAccount.executedCount.toNumber()).to.equal(0);
+      expect(policyAccount.executedCount.toNumber()).to.equal(1);
     });
 
-    it("atomicity: repeated execute attempts still fail and ticket remains Open", async () => {
+    it("replay: repeated execute attempts fail and ticket remains Executed", async () => {
       const slot = await provider.connection.getSlot();
       await oracleProgram.methods
         .setFeed(new anchor.BN(160_000_000), new anchor.BN(slot))
@@ -471,16 +627,22 @@ describe("catalyst_guard", () => {
             policy: policyPDA,
             keeper: authority.publicKey,
             oracle: oracleFeed.publicKey,
+            driftProgram: DRIFT_PROGRAM_ID,
+            driftState: driftStatePDA,
+            driftUser: driftUserPDA,
+            driftUserStats: driftUserStatsPDA,
+            driftSpotMarket: driftSpotMarketPDA,
+            driftPerpMarket: driftPerpMarket0PDA,
           })
           .rpc();
-        expect.fail("Should have thrown – Drift CPI unavailable");
+        expect.fail("Should have thrown – ticket already consumed");
       } catch (err: any) {
-        expect(err.toString()).to.contain("DriftCpiUnavailable");
+        expect(err.toString()).to.contain("TicketAlreadyConsumed");
       }
 
       const ticketAccount = await program.account.ticket.fetch(ticketPDA);
-      expect(ticketAccount.status).to.deep.equal({ open: {} });
-      expect(ticketAccount.executedSlot.toNumber()).to.equal(0);
+      expect(ticketAccount.status).to.deep.equal({ executed: {} });
+      expect(ticketAccount.executedSlot.toNumber()).to.be.greaterThan(0);
     });
 
     it("rejects execution with wrong reveal data (P2)", async () => {
@@ -525,12 +687,232 @@ describe("catalyst_guard", () => {
             policy: policyPDA,
             keeper: authority.publicKey,
             oracle: oracleFeed.publicKey,
+            driftProgram: DRIFT_PROGRAM_ID,
+            driftState: driftStatePDA,
+            driftUser: driftUserPDA,
+            driftUserStats: driftUserStatsPDA,
+            driftSpotMarket: driftSpotMarketPDA,
+            driftPerpMarket: driftPerpMarket0PDA,
           })
           .rpc();
         expect.fail("Should have thrown – commitment mismatch");
       } catch (err: any) {
         expect(err.toString()).to.contain("CommitmentMismatch");
       }
+    });
+  });
+
+  // ── Drift CPI Firewall: boundary validations (MVP) ────────────
+
+  describe("Drift CPI firewall (MVP)", () => {
+    async function createExecutableTicket(payload: HedgePayloadV1) {
+      const revealData = serializePayload(payload);
+      const ticketId = randomBytes(32);
+      const secretSalt = randomBytes(32);
+      const commitment = createCommitment(
+        authority.publicKey,
+        policyPDA,
+        ticketId,
+        secretSalt,
+        revealData
+      );
+      const now = Math.floor(Date.now() / 1000);
+      const [ticketPDA] = findTicketPDA(program.programId, policyPDA, ticketId);
+
+      await program.methods
+        .createTicket(
+          Array.from(commitment) as any,
+          Array.from(ticketId) as any,
+          new anchor.BN(now + 3600)
+        )
+        .accounts({
+          ticket: ticketPDA,
+          policy: policyPDA,
+          owner: authority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+
+      // Make oracle fresh and predicate satisfied.
+      const slot = await provider.connection.getSlot();
+      await oracleProgram.methods
+        .setFeed(new anchor.BN(160_000_000), new anchor.BN(slot))
+        .accounts({
+          feed: oracleFeed.publicKey,
+          authority: authority.publicKey,
+        })
+        .rpc();
+
+      return { ticketPDA, secretSalt, revealData };
+    }
+
+    it("rejects wrong Drift program id before CPI (InvalidDriftProgram)", async () => {
+      const payload = defaultPayload();
+      const { ticketPDA, secretSalt, revealData } = await createExecutableTicket(payload);
+
+      try {
+        await program.methods
+          .executeTicket(Array.from(secretSalt) as any, revealData)
+          .accounts({
+            ticket: ticketPDA,
+            policy: policyPDA,
+            keeper: authority.publicKey,
+            oracle: oracleFeed.publicKey,
+            driftProgram: SystemProgram.programId, // wrong
+            driftState: driftStatePDA,
+            driftUser: driftUserPDA,
+            driftUserStats: driftUserStatsPDA,
+            driftSpotMarket: driftSpotMarketPDA,
+            driftPerpMarket: driftPerpMarket0PDA,
+          })
+          .rpc();
+        expect.fail("Should have thrown – invalid drift program");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("InvalidDriftProgram");
+      }
+
+      const ticketAccount = await program.account.ticket.fetch(ticketPDA);
+      expect(ticketAccount.status).to.deep.equal({ open: {} });
+    });
+
+    it("rejects wrong Drift user PDA before CPI (InvalidDriftUser)", async () => {
+      const payload = defaultPayload();
+      const { ticketPDA, secretSalt, revealData } = await createExecutableTicket(payload);
+
+      const [wrongDriftUser] = findDriftUserPDA(authority.publicKey, 1);
+
+      try {
+        await program.methods
+          .executeTicket(Array.from(secretSalt) as any, revealData)
+          .accounts({
+            ticket: ticketPDA,
+            policy: policyPDA,
+            keeper: authority.publicKey,
+            oracle: oracleFeed.publicKey,
+            driftProgram: DRIFT_PROGRAM_ID,
+            driftState: driftStatePDA,
+            driftUser: wrongDriftUser, // wrong
+            driftUserStats: driftUserStatsPDA,
+            driftSpotMarket: driftSpotMarketPDA,
+            driftPerpMarket: driftPerpMarket0PDA,
+          })
+          .rpc();
+        expect.fail("Should have thrown – invalid drift user");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("InvalidDriftUser");
+      }
+
+      const ticketAccount = await program.account.ticket.fetch(ticketPDA);
+      expect(ticketAccount.status).to.deep.equal({ open: {} });
+    });
+
+    it("rejects wrong perp market account before CPI (InvalidDriftPerpMarket)", async () => {
+      const payload = defaultPayload(); // marketIndex=0
+      const { ticketPDA, secretSalt, revealData } = await createExecutableTicket(payload);
+
+      try {
+        await program.methods
+          .executeTicket(Array.from(secretSalt) as any, revealData)
+          .accounts({
+            ticket: ticketPDA,
+            policy: policyPDA,
+            keeper: authority.publicKey,
+            oracle: oracleFeed.publicKey,
+            driftProgram: DRIFT_PROGRAM_ID,
+            driftState: driftStatePDA,
+            driftUser: driftUserPDA,
+            driftUserStats: driftUserStatsPDA,
+            driftSpotMarket: driftSpotMarketPDA,
+            driftPerpMarket: driftPerpMarket5PDA, // wrong market
+          })
+          .rpc();
+        expect.fail("Should have thrown – invalid perp market");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("InvalidDriftPerpMarket");
+      }
+
+      const ticketAccount = await program.account.ticket.fetch(ticketPDA);
+      expect(ticketAccount.status).to.deep.equal({ open: {} });
+    });
+
+    it("rejects oracle mismatch vs perp market before CPI (InvalidOracleAccount)", async () => {
+      // Create a second oracle feed and bind the payload to it, but keep the perp market bound to the original feed.
+      const oracleFeedB = Keypair.generate();
+      const slot = await provider.connection.getSlot();
+      await oracleProgram.methods
+        .initFeed(new anchor.BN(160_000_000), new anchor.BN(slot))
+        .accounts({
+          feed: oracleFeedB.publicKey,
+          authority: authority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([oracleFeedB])
+        .rpc();
+
+      const payload = defaultPayload();
+      payload.oracle = oracleFeedB.publicKey;
+      payload.oracleProgram = oracleProgram.programId;
+
+      const revealData = serializePayload(payload);
+      const ticketId = randomBytes(32);
+      const secretSalt = randomBytes(32);
+      const commitment = createCommitment(
+        authority.publicKey,
+        policyPDA,
+        ticketId,
+        secretSalt,
+        revealData
+      );
+      const now = Math.floor(Date.now() / 1000);
+      const [ticketPDA] = findTicketPDA(program.programId, policyPDA, ticketId);
+
+      await program.methods
+        .createTicket(
+          Array.from(commitment) as any,
+          Array.from(ticketId) as any,
+          new anchor.BN(now + 3600)
+        )
+        .accounts({
+          ticket: ticketPDA,
+          policy: policyPDA,
+          owner: authority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+
+      // Update feed B so predicate is satisfied.
+      const slot2 = await provider.connection.getSlot();
+      await oracleProgram.methods
+        .setFeed(new anchor.BN(160_000_000), new anchor.BN(slot2))
+        .accounts({
+          feed: oracleFeedB.publicKey,
+          authority: authority.publicKey,
+        })
+        .rpc();
+
+      try {
+        await program.methods
+          .executeTicket(Array.from(secretSalt) as any, revealData)
+          .accounts({
+            ticket: ticketPDA,
+            policy: policyPDA,
+            keeper: authority.publicKey,
+            oracle: oracleFeedB.publicKey, // matches payload
+            driftProgram: DRIFT_PROGRAM_ID,
+            driftState: driftStatePDA,
+            driftUser: driftUserPDA,
+            driftUserStats: driftUserStatsPDA,
+            driftSpotMarket: driftSpotMarketPDA,
+            driftPerpMarket: driftPerpMarket0PDA, // market oracle is still feed A
+          })
+          .rpc();
+        expect.fail("Should have thrown – oracle mismatch");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("InvalidOracleAccount");
+      }
+
+      const ticketAccount = await program.account.ticket.fetch(ticketPDA);
+      expect(ticketAccount.status).to.deep.equal({ open: {} });
     });
   });
 
@@ -625,12 +1007,43 @@ describe("catalyst_guard", () => {
 
   describe("Policy-binding enforcement", () => {
     it("rejects execute_ticket with a different policy than ticket.policy", async () => {
-      const driftSubAccountB = Keypair.generate();
+      // Create a second policy under a different authority (policy B),
+      // then attempt to execute a ticket from policy A under policy B.
+      const impostor = Keypair.generate();
+      const airdropSig = await provider.connection.requestAirdrop(
+        impostor.publicKey,
+        2_000_000_000
+      );
+      await provider.connection.confirmTransaction(airdropSig);
+
+      const [driftUserB] = findDriftUserPDA(impostor.publicKey, DRIFT_SUB_ACCOUNT_ID);
+      const [driftUserStatsB] = findDriftUserStatsPDA(impostor.publicKey);
       const [policyBPDA] = findPolicyPDA(
         program.programId,
-        authority.publicKey,
-        driftSubAccountB.publicKey
+        impostor.publicKey,
+        driftUserB
       );
+
+      // Initialize required Drift stub accounts for the impostor authority.
+      await driftStub.methods
+        .initUser(DRIFT_SUB_ACCOUNT_ID)
+        .accounts({
+          user: driftUserB,
+          authority: impostor.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([impostor])
+        .rpc();
+
+      await driftStub.methods
+        .initUserStats()
+        .accounts({
+          userStats: driftUserStatsB,
+          authority: impostor.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([impostor])
+        .rpc();
 
       await program.methods
         .initPolicy(
@@ -644,10 +1057,11 @@ describe("catalyst_guard", () => {
         )
         .accounts({
           policy: policyBPDA,
-          authority: authority.publicKey,
-          driftSubAccount: driftSubAccountB.publicKey,
+          authority: impostor.publicKey,
+          driftSubAccount: driftUserB,
           systemProgram: SystemProgram.programId,
         })
+        .signers([impostor])
         .rpc();
 
       const revealDataBypass = serializePayload(defaultPayload());
@@ -703,6 +1117,12 @@ describe("catalyst_guard", () => {
             policy: policyBPDA,
             keeper: authority.publicKey,
             oracle: oracleFeed.publicKey,
+            driftProgram: DRIFT_PROGRAM_ID,
+            driftState: driftStatePDA,
+            driftUser: driftUserPDA,
+            driftUserStats: driftUserStatsPDA,
+            driftSpotMarket: driftSpotMarketPDA,
+            driftPerpMarket: driftPerpMarket0PDA,
           })
           .rpc();
         expect.fail("Should have thrown – policy mismatch");
@@ -781,6 +1201,12 @@ describe("catalyst_guard", () => {
             policy: policyPDA,
             keeper: authority.publicKey,
             oracle: oracleFeed.publicKey,
+            driftProgram: DRIFT_PROGRAM_ID,
+            driftState: driftStatePDA,
+            driftUser: driftUserPDA,
+            driftUserStats: driftUserStatsPDA,
+            driftSpotMarket: driftSpotMarketPDA,
+            driftPerpMarket: driftPerpMarket0PDA,
           })
           .rpc();
         expect.fail("Should have thrown – wrong salt");
@@ -789,12 +1215,21 @@ describe("catalyst_guard", () => {
       }
     });
 
-    it("atomicity: correct salt + reveal validates but still fails without Drift CPI", async () => {
+    it("atomicity: CPI failure does not consume the ticket", async () => {
       const slot = await provider.connection.getSlot();
       await oracleProgram.methods
         .setFeed(new anchor.BN(160_000_000), new anchor.BN(slot))
         .accounts({
           feed: oracleFeed.publicKey,
+          authority: authority.publicKey,
+        })
+        .rpc();
+
+      // Break delegate configuration so the Drift CPI fails inside the stub.
+      await driftStub.methods
+        .updateUserDelegate(ZERO_PUBKEY)
+        .accounts({
+          user: driftUserPDA,
           authority: authority.publicKey,
         })
         .rpc();
@@ -810,15 +1245,30 @@ describe("catalyst_guard", () => {
             policy: policyPDA,
             keeper: authority.publicKey,
             oracle: oracleFeed.publicKey,
+            driftProgram: DRIFT_PROGRAM_ID,
+            driftState: driftStatePDA,
+            driftUser: driftUserPDA,
+            driftUserStats: driftUserStatsPDA,
+            driftSpotMarket: driftSpotMarketPDA,
+            driftPerpMarket: driftPerpMarket0PDA,
           })
           .rpc();
-        expect.fail("Should have thrown – Drift CPI unavailable");
+        expect.fail("Should have thrown – Drift CPI unauthorized");
       } catch (err: any) {
-        expect(err.toString()).to.contain("DriftCpiUnavailable");
+        expect(err.toString()).to.contain("Unauthorized");
       }
 
       const ticketAccount = await program.account.ticket.fetch(commitTicketPDA);
       expect(ticketAccount.status).to.deep.equal({ open: {} });
+
+      // Restore correct delegate so later tests can execute successfully.
+      await driftStub.methods
+        .updateUserDelegate(policyPDA)
+        .accounts({
+          user: driftUserPDA,
+          authority: authority.publicKey,
+        })
+        .rpc();
     });
   });
 
@@ -869,15 +1319,25 @@ describe("catalyst_guard", () => {
         })
         .rpc();
 
-      return program.methods
+      const [driftPerpMarket] = findDriftPerpMarketPDA(payload.marketIndex);
+
+      const tx = await program.methods
         .executeTicket(Array.from(secretSalt) as any, revealData)
         .accounts({
           ticket: ticketPDA,
           policy: policyPDA,
           keeper: authority.publicKey,
           oracle: oracleFeed.publicKey,
+          driftProgram: DRIFT_PROGRAM_ID,
+          driftState: driftStatePDA,
+          driftUser: driftUserPDA,
+          driftUserStats: driftUserStatsPDA,
+          driftSpotMarket: driftSpotMarketPDA,
+          driftPerpMarket,
         })
         .rpc();
+
+      return { ticketPDA, tx };
     }
 
     it("rejects execute_ticket when predicate not met (PredicateNotMet)", async () => {
@@ -928,6 +1388,12 @@ describe("catalyst_guard", () => {
             policy: policyPDA,
             keeper: authority.publicKey,
             oracle: oracleFeed.publicKey,
+            driftProgram: DRIFT_PROGRAM_ID,
+            driftState: driftStatePDA,
+            driftUser: driftUserPDA,
+            driftUserStats: driftUserStatsPDA,
+            driftSpotMarket: driftSpotMarketPDA,
+            driftPerpMarket: driftPerpMarket0PDA,
           })
           .rpc();
         expect.fail("Should have thrown – predicate not met");
@@ -983,6 +1449,12 @@ describe("catalyst_guard", () => {
             policy: policyPDA,
             keeper: authority.publicKey,
             oracle: oracleFeed.publicKey,
+            driftProgram: DRIFT_PROGRAM_ID,
+            driftState: driftStatePDA,
+            driftUser: driftUserPDA,
+            driftUserStats: driftUserStatsPDA,
+            driftSpotMarket: driftSpotMarketPDA,
+            driftPerpMarket: driftPerpMarket0PDA,
           })
           .rpc();
         expect.fail("Should have thrown – oracle stale");
@@ -1057,24 +1529,18 @@ describe("catalyst_guard", () => {
       payload.orderType = OrderType.Limit;
       payload.limitPrice = BigInt(155_000_000);
 
-      try {
-        await createAndExecute(payload);
-        expect.fail("Should have thrown – Drift CPI unavailable");
-      } catch (err: any) {
-        expect(err.toString()).to.contain("DriftCpiUnavailable");
-      }
+      const { ticketPDA } = await createAndExecute(payload);
+      const ticketAccount = await program.account.ticket.fetch(ticketPDA);
+      expect(ticketAccount.status).to.deep.equal({ executed: {} });
     });
 
     it("accepts payload on allowed market index 5", async () => {
       const payload = defaultPayload();
       payload.marketIndex = 5;
 
-      try {
-        await createAndExecute(payload);
-        expect.fail("Should have thrown – Drift CPI unavailable");
-      } catch (err: any) {
-        expect(err.toString()).to.contain("DriftCpiUnavailable");
-      }
+      const { ticketPDA } = await createAndExecute(payload);
+      const ticketAccount = await program.account.ticket.fetch(ticketPDA);
+      expect(ticketAccount.status).to.deep.equal({ executed: {} });
     });
 
     it("rejects invalid Borsh (truncated payload)", async () => {
@@ -1118,6 +1584,12 @@ describe("catalyst_guard", () => {
             policy: policyPDA,
             keeper: authority.publicKey,
             oracle: oracleFeed.publicKey,
+            driftProgram: DRIFT_PROGRAM_ID,
+            driftState: driftStatePDA,
+            driftUser: driftUserPDA,
+            driftUserStats: driftUserStatsPDA,
+            driftSpotMarket: driftSpotMarketPDA,
+            driftPerpMarket: driftPerpMarket0PDA,
           })
           .rpc();
         expect.fail("Should have thrown – invalid Borsh");

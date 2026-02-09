@@ -1,0 +1,23 @@
+[package]
+name = "drift_stub"
+version = "0.1.0"
+description = "Localnet stub of Drift v2 for CatalystGuard CPI integration tests"
+edition = "2021"
+license = "BUSL-1.1"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "drift_stub"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build"]
+
+[dependencies]
+anchor-lang = { workspace = true }
+drift_cpi = { path = "../../crates/drift_cpi" }
+
