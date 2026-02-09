@@ -861,6 +861,261 @@ describe("catalyst_guard", () => {
       }
     });
 
+    it("rejects execute on paused policy", async () => {
+      // Pause policy A
+      await program.methods
+        .pausePolicy(true)
+        .accounts({
+          policy: policyPDA,
+          authority: authority.publicKey,
+        })
+        .rpc();
+
+      const payload = defaultPayload();
+      const revealData = serializePayload(payload);
+      const ticketId = randomBytes(32);
+      const secretSalt = randomBytes(32);
+      const commitment = createCommitment(
+        authority.publicKey,
+        policyPDA,
+        ticketId,
+        secretSalt,
+        revealData
+      );
+      const now = Math.floor(Date.now() / 1000);
+
+      const [ticketPDA] = findTicketPDA(
+        program.programId,
+        policyPDA,
+        ticketId
+      );
+
+      // Create ticket should also fail since policy is paused
+      try {
+        await program.methods
+          .createTicket(
+            Array.from(commitment) as any,
+            Array.from(ticketId) as any,
+            new anchor.BN(now + 3600)
+          )
+          .accounts({
+            ticket: ticketPDA,
+            policy: policyPDA,
+            owner: authority.publicKey,
+            systemProgram: SystemProgram.programId,
+          })
+          .rpc();
+        expect.fail("Should have thrown – policy paused");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("PolicyPaused");
+      }
+
+      // Unpause for subsequent tests
+      await program.methods
+        .pausePolicy(false)
+        .accounts({
+          policy: policyPDA,
+          authority: authority.publicKey,
+        })
+        .rpc();
+    });
+
+    it("rejects cancel from non-owner (NotTicketOwner)", async () => {
+      const payload = defaultPayload();
+      const revealData = serializePayload(payload);
+      const ticketId = randomBytes(32);
+      const secretSalt = randomBytes(32);
+      const commitment = createCommitment(
+        authority.publicKey,
+        policyPDA,
+        ticketId,
+        secretSalt,
+        revealData
+      );
+      const now = Math.floor(Date.now() / 1000);
+
+      const [ticketPDA] = findTicketPDA(
+        program.programId,
+        policyPDA,
+        ticketId
+      );
+
+      await program.methods
+        .createTicket(
+          Array.from(commitment) as any,
+          Array.from(ticketId) as any,
+          new anchor.BN(now + 3600)
+        )
+        .accounts({
+          ticket: ticketPDA,
+          policy: policyPDA,
+          owner: authority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+
+      const impostor = Keypair.generate();
+      try {
+        await program.methods
+          .cancelTicket()
+          .accounts({
+            ticket: ticketPDA,
+            owner: impostor.publicKey,
+          })
+          .signers([impostor])
+          .rpc();
+        expect.fail("Should have thrown – not owner");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("NotTicketOwner");
+      }
+    });
+
+    it("rejects expire on non-expired ticket (TicketNotExpired)", async () => {
+      const payload = defaultPayload();
+      const revealData = serializePayload(payload);
+      const ticketId = randomBytes(32);
+      const secretSalt = randomBytes(32);
+      const commitment = createCommitment(
+        authority.publicKey,
+        policyPDA,
+        ticketId,
+        secretSalt,
+        revealData
+      );
+      const now = Math.floor(Date.now() / 1000);
+
+      const [ticketPDA] = findTicketPDA(
+        program.programId,
+        policyPDA,
+        ticketId
+      );
+
+      await program.methods
+        .createTicket(
+          Array.from(commitment) as any,
+          Array.from(ticketId) as any,
+          new anchor.BN(now + 3600) // expires in 1 hour
+        )
+        .accounts({
+          ticket: ticketPDA,
+          policy: policyPDA,
+          owner: authority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+
+      try {
+        await program.methods
+          .expireTicket()
+          .accounts({
+            ticket: ticketPDA,
+            cranker: authority.publicKey,
+          })
+          .rpc();
+        expect.fail("Should have thrown – ticket not yet expired");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("TicketNotExpired");
+      }
+    });
+
+    it("rejects ticket creation with expiry too far in future (>7d)", async () => {
+      const payload = defaultPayload();
+      const revealData = serializePayload(payload);
+      const ticketId = randomBytes(32);
+      const secretSalt = randomBytes(32);
+      const commitment = createCommitment(
+        authority.publicKey,
+        policyPDA,
+        ticketId,
+        secretSalt,
+        revealData
+      );
+
+      const [ticketPDA] = findTicketPDA(
+        program.programId,
+        policyPDA,
+        ticketId
+      );
+
+      const eightDays = Math.floor(Date.now() / 1000) + 8 * 24 * 60 * 60;
+      try {
+        await program.methods
+          .createTicket(
+            Array.from(commitment) as any,
+            Array.from(ticketId) as any,
+            new anchor.BN(eightDays)
+          )
+          .accounts({
+            ticket: ticketPDA,
+            policy: policyPDA,
+            owner: authority.publicKey,
+            systemProgram: SystemProgram.programId,
+          })
+          .rpc();
+        expect.fail("Should have thrown – expiry too far");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("ExpiryTooFar");
+      }
+    });
+
+    it("rejects double-cancel (TicketAlreadyConsumed)", async () => {
+      const payload = defaultPayload();
+      const revealData = serializePayload(payload);
+      const ticketId = randomBytes(32);
+      const secretSalt = randomBytes(32);
+      const commitment = createCommitment(
+        authority.publicKey,
+        policyPDA,
+        ticketId,
+        secretSalt,
+        revealData
+      );
+      const now = Math.floor(Date.now() / 1000);
+
+      const [ticketPDA] = findTicketPDA(
+        program.programId,
+        policyPDA,
+        ticketId
+      );
+
+      await program.methods
+        .createTicket(
+          Array.from(commitment) as any,
+          Array.from(ticketId) as any,
+          new anchor.BN(now + 3600)
+        )
+        .accounts({
+          ticket: ticketPDA,
+          policy: policyPDA,
+          owner: authority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .rpc();
+
+      // First cancel succeeds
+      await program.methods
+        .cancelTicket()
+        .accounts({
+          ticket: ticketPDA,
+          owner: authority.publicKey,
+        })
+        .rpc();
+
+      // Second cancel must fail
+      try {
+        await program.methods
+          .cancelTicket()
+          .accounts({
+            ticket: ticketPDA,
+            owner: authority.publicKey,
+          })
+          .rpc();
+        expect.fail("Should have thrown – already cancelled");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("TicketAlreadyConsumed");
+      }
+    });
+
     it("verifies ticket_count increments on create", async () => {
       const policyBefore = await program.account.policy.fetch(policyPDA);
       const countBefore = policyBefore.ticketCount.toNumber();
