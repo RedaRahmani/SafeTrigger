@@ -4,6 +4,7 @@ use anchor_lang::prelude::*;
 use sha2::{Digest, Sha256};
 
 use crate::error::CatalystError;
+use crate::state::payload::HedgePayloadV1;
 use crate::state::policy::{Policy, POLICY_SEED};
 use crate::state::ticket::*;
 
@@ -28,6 +29,7 @@ pub struct CreateTicket<'info> {
     pub ticket: Account<'info, Ticket>,
 
     #[account(
+        mut,
         constraint = !policy.paused @ CatalystError::PolicyPaused,
     )]
     pub policy: Account<'info, Policy>,
@@ -70,10 +72,11 @@ pub fn handle_create_ticket(
     ticket.executed_slot = 0;
 
     // Increment policy ticket count
-    let policy = &mut ctx.accounts.policy.to_account_info();
-    // NOTE: We read policy as immutable above (no `mut` in Accounts) to
-    // keep it simple for M0. In M1 we will add mut + increment safely.
-    let _ = policy;
+    let policy = &mut ctx.accounts.policy;
+    policy.ticket_count = policy
+        .ticket_count
+        .checked_add(1)
+        .ok_or(CatalystError::MathOverflow)?;
 
     msg!(
         "Ticket created: commitment={:?}, expiry={}",
@@ -149,6 +152,7 @@ pub struct ExecuteTicket<'info> {
     pub ticket: Account<'info, Ticket>,
 
     #[account(
+        mut,
         constraint = !policy.paused @ CatalystError::PolicyPaused,
         seeds = [POLICY_SEED, policy.authority.as_ref(), policy.drift_sub_account.as_ref()],
         bump = policy.bump,
@@ -157,8 +161,6 @@ pub struct ExecuteTicket<'info> {
 
     /// The keeper executing the ticket. Permissionless (anyone may execute).
     pub keeper: Signer<'info>,
-    // NOTE: Drift CPI accounts will be added in Milestone 1.
-    // For M0, we verify the commitment and mark executed without CPI.
 }
 
 pub fn handle_execute_ticket(
@@ -167,6 +169,7 @@ pub fn handle_execute_ticket(
     revealed_data: Vec<u8>,
 ) -> Result<()> {
     let ticket = &mut ctx.accounts.ticket;
+    let policy = &mut ctx.accounts.policy;
     let clock = Clock::get()?;
 
     // ── P2: Verify commitment (domain-separated, owner/policy-bound) ──
@@ -185,18 +188,58 @@ pub fn handle_execute_ticket(
         CatalystError::CommitmentMismatch
     );
 
+    // ── M1: Deserialize revealed payload ────────────────────────
+    let payload = HedgePayloadV1::try_from_slice(&revealed_data)
+        .map_err(|_| CatalystError::InvalidRevealData)?;
+
+    // ── M1: Validate payload against policy bounds ──────────────
+    payload.validate_against_policy(
+        &policy.allowed_markets,
+        policy.max_base_amount,
+        policy.reduce_only,
+        clock.unix_timestamp,
+    )?;
+
+    // ── M1: Rate limiting ───────────────────────────────────────
+    // Simple rate limit: enforce minimum interval between executions.
+    // min_interval = max_time_window / rate_limit_per_window
+    if policy.rate_limit_per_window > 0 && policy.last_executed_at > 0 {
+        let min_interval = policy
+            .max_time_window
+            .checked_div(policy.rate_limit_per_window as i64)
+            .unwrap_or(0);
+        let elapsed = clock
+            .unix_timestamp
+            .checked_sub(policy.last_executed_at)
+            .ok_or(CatalystError::MathOverflow)?;
+        require!(elapsed >= min_interval, CatalystError::RateLimitExceeded);
+    }
+
     // ── P3: Mark as consumed (replay protection) ────────────────
     ticket.status = TicketStatus::Executed;
     ticket.executed_slot = clock.slot;
     ticket.updated_at = clock.unix_timestamp;
 
-    // ── P4: CPI to Drift (stubbed for M0) ───────────────────────
-    // In Milestone 1, this will:
-    //   1. Deserialize revealed_data into trigger params + BoundedOrderParams
-    //   2. Validate params against policy bounds
-    //   3. CPI to Drift with hardcoded program ID
-    //   4. Verify Drift instruction discriminator is in allowlist
-    msg!("Ticket executed: commitment verified, slot={}", clock.slot);
+    // ── Update policy counters ──────────────────────────────────
+    policy.executed_count = policy
+        .executed_count
+        .checked_add(1)
+        .ok_or(CatalystError::MathOverflow)?;
+    policy.last_executed_at = clock.unix_timestamp;
+    policy.updated_at = clock.unix_timestamp;
+
+    // ── P4: Drift CPI ───────────────────────────────────────────
+    // In a full deployment with Drift on-chain, we would CPI here.
+    // For localnet without Drift, we validate the payload and log.
+    // The actual CPI path is gated on having Drift accounts available
+    // (added in feat(drift-cpi) step).
+    msg!(
+        "Ticket executed: market={}, side={:?}, amount={}, slot={}",
+        payload.market_index,
+        payload.side,
+        payload.base_amount,
+        clock.slot
+    );
 
     Ok(())
 }

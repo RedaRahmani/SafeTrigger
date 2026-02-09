@@ -71,6 +71,7 @@ pub fn handle_init_policy(
     policy.executed_count = 0;
     policy.created_at = clock.unix_timestamp;
     policy.updated_at = clock.unix_timestamp;
+    policy.last_executed_at = 0;
 
     msg!(
         "Policy initialized for sub-account {}",

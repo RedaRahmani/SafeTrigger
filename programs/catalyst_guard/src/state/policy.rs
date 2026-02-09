@@ -58,6 +58,9 @@ pub struct Policy {
 
     /// Timestamp of last update.
     pub updated_at: i64,
+
+    /// Timestamp of last ticket execution (for rate limiting).
+    pub last_executed_at: i64,
 }
 
 impl Policy {
@@ -79,7 +82,8 @@ impl Policy {
         + 8   // ticket_count
         + 8   // executed_count
         + 8   // created_at
-        + 8 // updated_at
+        + 8   // updated_at
+        + 8 // last_executed_at
     }
 
     /// Fixed space: always allocates for MAX_ALLOWED_MARKETS so that
@@ -131,6 +135,7 @@ mod tests {
             executed_count: 0,
             created_at: 0,
             updated_at: 0,
+            last_executed_at: 0,
         };
         assert!(policy.is_market_allowed(0));
         assert!(policy.is_market_allowed(5));

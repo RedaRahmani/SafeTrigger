@@ -3,10 +3,10 @@
  *
  * Provides helpers for:
  * - Creating commitment hashes (SHA-256, domain-separated)
- * - Building ticket creation transactions
- * - Reading policy and ticket accounts
+ * - Building and serializing HedgePayloadV1 for sealed intents
+ * - PDA derivation for policy and ticket accounts
  *
- * Stub for Milestone 0 – full implementation in Milestone 2.
+ * Milestone 1 – v0.3 MVP
  */
 
 import { sha256 } from "js-sha256";
@@ -23,6 +23,103 @@ export const TICKET_SEED = Buffer.from("ticket");
 
 /** Domain separator for commitment preimage (must match on-chain constant). */
 export const COMMITMENT_DOMAIN = Buffer.from("CSv0.2");
+
+// ── Enums (must match Borsh order in Rust) ──────────────────────
+
+/** Trigger direction – matches on-chain TriggerDirection enum. */
+export enum TriggerDirection {
+  Above = 0,
+  Below = 1,
+}
+
+/** Position direction – matches drift_cpi::PositionDirection enum. */
+export enum PositionDirection {
+  Long = 0,
+  Short = 1,
+}
+
+/** Order type – matches drift_cpi::OrderType enum. */
+export enum OrderType {
+  Market = 0,
+  Limit = 1,
+}
+
+// ── HedgePayloadV1 ─────────────────────────────────────────────
+
+export interface HedgePayloadV1 {
+  marketIndex: number; // u16
+  triggerDirection: TriggerDirection;
+  triggerPrice: bigint; // u64
+  side: PositionDirection;
+  baseAmount: bigint; // u64
+  reduceOnly: boolean;
+  orderType: OrderType;
+  limitPrice: bigint | null; // Option<u64>
+  maxSlippageBps: number; // u16
+  deadlineTs: bigint; // i64
+}
+
+/**
+ * Borsh-serialize a HedgePayloadV1 to bytes.
+ * Layout must exactly match the Rust struct field order and Borsh encoding:
+ *   u16 + enum(u8) + u64 + enum(u8) + u64 + bool(u8) + enum(u8) + Option<u64> + u16 + i64
+ */
+export function serializeHedgePayload(p: HedgePayloadV1): Buffer {
+  // Calculate size: 2 + 1 + 8 + 1 + 8 + 1 + 1 + (1 + optional 8) + 2 + 8
+  const hasLimit = p.limitPrice !== null && p.limitPrice !== undefined;
+  const size = 2 + 1 + 8 + 1 + 8 + 1 + 1 + 1 + (hasLimit ? 8 : 0) + 2 + 8;
+  const buf = Buffer.alloc(size);
+  let offset = 0;
+
+  // market_index: u16 LE
+  buf.writeUInt16LE(p.marketIndex, offset);
+  offset += 2;
+
+  // trigger_direction: enum as u8
+  buf.writeUInt8(p.triggerDirection, offset);
+  offset += 1;
+
+  // trigger_price: u64 LE
+  buf.writeBigUInt64LE(BigInt(p.triggerPrice), offset);
+  offset += 8;
+
+  // side: enum as u8
+  buf.writeUInt8(p.side, offset);
+  offset += 1;
+
+  // base_amount: u64 LE
+  buf.writeBigUInt64LE(BigInt(p.baseAmount), offset);
+  offset += 8;
+
+  // reduce_only: bool as u8
+  buf.writeUInt8(p.reduceOnly ? 1 : 0, offset);
+  offset += 1;
+
+  // order_type: enum as u8
+  buf.writeUInt8(p.orderType, offset);
+  offset += 1;
+
+  // limit_price: Option<u64> — 0x00 for None, 0x01 + u64 LE for Some
+  if (hasLimit) {
+    buf.writeUInt8(1, offset);
+    offset += 1;
+    buf.writeBigUInt64LE(BigInt(p.limitPrice!), offset);
+    offset += 8;
+  } else {
+    buf.writeUInt8(0, offset);
+    offset += 1;
+  }
+
+  // max_slippage_bps: u16 LE
+  buf.writeUInt16LE(p.maxSlippageBps, offset);
+  offset += 2;
+
+  // deadline_ts: i64 LE
+  buf.writeBigInt64LE(BigInt(p.deadlineTs), offset);
+  offset += 8;
+
+  return buf;
+}
 
 // ── Commitment helpers ──────────────────────────────────────────
 
