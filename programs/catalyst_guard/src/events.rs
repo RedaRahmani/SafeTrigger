@@ -31,12 +31,16 @@ pub struct TicketExecuted {
     pub ticket: Pubkey,
     /// Keeper who executed the ticket.
     pub keeper: Pubkey,
+    /// SHA-256 hash of the revealed payload bytes (Borsh serialized).
+    pub payload_hash: [u8; 32],
     /// Market index from the revealed payload.
     pub market_index: u16,
     /// Base asset amount from the revealed payload.
     pub base_amount: u64,
     /// Slot at execution.
     pub slot: u64,
+    /// Unix timestamp at execution.
+    pub timestamp: i64,
 }
 
 /// Emitted when a ticket is cancelled by the owner.

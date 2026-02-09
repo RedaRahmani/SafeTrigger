@@ -244,6 +244,10 @@ pub fn handle_execute_ticket(
         CatalystError::CommitmentMismatch
     );
 
+    // Receipt helper: hash only the revealed payload bytes, so clients can recompute
+    // independent of secret_salt and commitment construction.
+    let payload_hash: [u8; 32] = Sha256::digest(&revealed_data).into();
+
     // ── M1: Deserialize revealed payload ────────────────────────
     let payload = HedgePayloadV1::try_from_slice(&revealed_data)
         .map_err(|_| CatalystError::InvalidRevealData)?;
@@ -503,9 +507,11 @@ pub fn handle_execute_ticket(
         policy: policy.key(),
         ticket: ticket.key(),
         keeper: ctx.accounts.keeper.key(),
+        payload_hash,
         market_index: payload.market_index,
         base_amount: payload.base_amount,
         slot: clock.slot,
+        timestamp: clock.unix_timestamp,
     });
 
     Ok(())

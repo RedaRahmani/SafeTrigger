@@ -244,7 +244,7 @@ MVP does NOT use the instruction sysvar (`Sysvar<Instructions>`) to inspect surr
 | Event | Trigger | Fields |
 |-------|---------|--------|
 | `TicketCreated` | `create_ticket` | policy, ticket, owner, ticket_id, expiry, slot |
-| `TicketExecuted` | `execute_ticket` | policy, ticket, keeper, market_index, base_amount, slot |
+| `TicketExecuted` | `execute_ticket` | policy, ticket, keeper, payload_hash, market_index, base_amount, slot, timestamp |
 | `TicketCancelled` | `cancel_ticket` | ticket, owner, slot |
 | `TicketExpired` | `expire_ticket` | ticket, cranker, slot |
 

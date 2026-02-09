@@ -584,6 +584,29 @@ describe("catalyst_guard", () => {
         })
         .rpc();
 
+      // Receipt: payload_hash must match client-side sha256(revealed_payload_bytes).
+      // Use simulate() to avoid requiring RPC transaction history on local validator.
+      const expectedPayloadHash = createHash("sha256").update(revealData).digest();
+      const sim = await program.methods
+        .executeTicket(Array.from(secretSalt) as any, revealData)
+        .accounts({
+          ticket: ticketPDA,
+          policy: policyPDA,
+          keeper: authority.publicKey,
+          oracle: oracleFeed.publicKey,
+          driftProgram: DRIFT_PROGRAM_ID,
+          driftState: driftStatePDA,
+          driftUser: driftUserPDA,
+          driftUserStats: driftUserStatsPDA,
+          driftSpotMarket: driftSpotMarketPDA,
+          driftPerpMarket: driftPerpMarket0PDA,
+        })
+        .simulate();
+      // Anchor JS camelCases event names (TicketExecuted -> ticketExecuted).
+      const executedSim = sim.events?.find((e: any) => e.name === "ticketExecuted");
+      expect(executedSim).to.exist;
+      expect(Buffer.from(executedSim.data.payloadHash)).to.deep.equal(expectedPayloadHash);
+
       const tx = await program.methods
         .executeTicket(Array.from(secretSalt) as any, revealData)
         .accounts({
