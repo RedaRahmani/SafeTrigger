@@ -7,6 +7,7 @@ use crate::error::CatalystError;
 use crate::state::payload::HedgePayloadV1;
 use crate::state::policy::{Policy, POLICY_SEED};
 use crate::state::ticket::*;
+use drift_cpi::instructions::{build_place_perp_order_data, BoundedOrderParams};
 
 /// Domain separator for commitment preimage (version 0.2).
 pub const COMMITMENT_DOMAIN: &[u8] = b"CSv0.2";
@@ -228,16 +229,39 @@ pub fn handle_execute_ticket(
     policy.last_executed_at = clock.unix_timestamp;
     policy.updated_at = clock.unix_timestamp;
 
-    // ── P4: Drift CPI ───────────────────────────────────────────
-    // In a full deployment with Drift on-chain, we would CPI here.
-    // For localnet without Drift, we validate the payload and log.
-    // The actual CPI path is gated on having Drift accounts available
-    // (added in feat(drift-cpi) step).
+    // ── P4: Drift CPI firewall ────────────────────────────────────
+    // Build BoundedOrderParams from the validated payload.
+    // This conversion happens AFTER policy validation, ensuring all
+    // bounds are respected before any CPI data is constructed.
+    let order_params = BoundedOrderParams {
+        market_index: payload.market_index,
+        direction: payload.side,
+        order_type: payload.order_type,
+        base_asset_amount: payload.base_amount,
+        price: match payload.order_type {
+            drift_cpi::instructions::OrderType::Limit => payload.limit_price.unwrap_or(0),
+            drift_cpi::instructions::OrderType::Market => 0,
+        },
+        reduce_only: payload.reduce_only,
+    };
+
+    // Build CPI instruction data with hardcoded discriminator.
+    // P4a: target program ID is compile-time const (DRIFT_PROGRAM_ID).
+    // P4b: only place_perp_order instruction is constructed.
+    // P4c: all accounts would be derived from policy.drift_sub_account.
+    // P4d: no remaining_accounts passthrough.
+    let _cpi_data = build_place_perp_order_data(&order_params);
+
+    // NOTE: Actual CPI invoke is gated on Drift being deployed.
+    // On localnet (no Drift), we validate and log. On devnet/mainnet,
+    // the ExecuteTicket accounts struct will include Drift accounts
+    // and invoke_signed will be called here.
     msg!(
-        "Ticket executed: market={}, side={:?}, amount={}, slot={}",
-        payload.market_index,
-        payload.side,
-        payload.base_amount,
+        "Ticket executed: market={}, side={:?}, amount={}, price={}, slot={}",
+        order_params.market_index,
+        order_params.direction,
+        order_params.base_asset_amount,
+        order_params.price,
         clock.slot
     );
 

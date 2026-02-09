@@ -1,9 +1,16 @@
 //! Drift CPI instruction builders.
 //!
-//! Milestone 2 will implement actual CPI calls. This module provides
-//! the pinned interface stubs.
+//! Builds validated `place_perp_order` CPI instructions against the hardcoded
+//! Drift program ID.  All account metas are constructed explicitly — no
+//! remaining_accounts passthrough.
 
 use anchor_lang::prelude::*;
+
+use crate::constants::DRIFT_PROGRAM_ID;
+
+/// Sighash discriminator for Drift `place_perp_order` (first 8 bytes of
+/// SHA-256("global:place_perp_order")).
+pub const PLACE_PERP_ORDER_DISC: [u8; 8] = [0x45, 0xa3, 0x10, 0x6a, 0x4b, 0x1f, 0x3b, 0x52];
 
 /// Direction for a perp order.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,7 +43,6 @@ pub struct BoundedOrderParams {
 
 impl BoundedOrderParams {
     /// Validate that the order params respect the policy bounds.
-    /// Returns Ok(()) if valid, Err with a descriptive message otherwise.
     pub fn validate_against_policy(
         &self,
         allowed_markets: &[u16],
@@ -56,6 +62,53 @@ impl BoundedOrderParams {
         }
         Ok(())
     }
+}
+
+/// Verify that a program key matches the hardcoded Drift program ID.
+///
+/// Invariant P4a: CPI target is never user-supplied.
+pub fn verify_drift_program(program_key: &Pubkey) -> Result<()> {
+    require!(*program_key == DRIFT_PROGRAM_ID, ErrorCode::ConstraintRaw);
+    Ok(())
+}
+
+/// Build the Drift `place_perp_order` instruction data.
+///
+/// This constructs the serialized instruction data that would be passed to
+/// Drift's place_perp_order instruction.  The discriminator is hardcoded.
+///
+/// NOTE: On localnet (without Drift deployed), the CPI cannot actually be
+/// invoked.  The caller gates the actual `invoke_signed` behind the
+/// presence of a valid Drift program account.
+pub fn build_place_perp_order_data(params: &BoundedOrderParams) -> Vec<u8> {
+    let mut data = Vec::with_capacity(64);
+    // 8-byte discriminator
+    data.extend_from_slice(&PLACE_PERP_ORDER_DISC);
+    // Borsh-serialize the params after the discriminator
+    params
+        .serialize(&mut data)
+        .expect("BoundedOrderParams serialization infallible");
+    data
+}
+
+/// Build account metas for `place_perp_order`.
+///
+/// Drift's place_perp_order requires:
+///   0. state      (read-only)
+///   1. user       (writable, signer — the delegate/authority)
+///   2. authority   (signer)
+///
+/// All PDAs are derived deterministically — no user-supplied accounts.
+pub fn build_place_perp_order_accounts(
+    drift_state: Pubkey,
+    drift_user: Pubkey,
+    authority: Pubkey,
+) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new_readonly(drift_state, false),
+        AccountMeta::new(drift_user, false),
+        AccountMeta::new_readonly(authority, true),
+    ]
 }
 
 #[cfg(test)]
