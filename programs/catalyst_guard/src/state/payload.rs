@@ -107,7 +107,7 @@ impl HedgePayloadV1 {
         // 5. Limit price must be set for Limit orders
         if self.order_type == OrderType::Limit {
             require!(
-                self.limit_price.is_some(),
+                self.limit_price.unwrap_or(0) > 0,
                 crate::error::CatalystError::InvalidRevealData
             );
         }
@@ -212,6 +212,11 @@ mod tests {
         let mut p = sample_payload();
         p.order_type = OrderType::Limit;
         p.limit_price = None;
+        assert!(p
+            .validate_against_policy(&[0], 10_000_000_000, false, 1_000_000_000)
+            .is_err());
+
+        p.limit_price = Some(0);
         assert!(p
             .validate_against_policy(&[0], 10_000_000_000, false, 1_000_000_000)
             .is_err());

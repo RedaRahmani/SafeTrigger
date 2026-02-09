@@ -225,7 +225,7 @@ MVP does NOT use the instruction sysvar (`Sysvar<Instructions>`) to inspect surr
 
 **Mechanism:**
 - `policy.rate_limit_per_window` and `policy.max_time_window` define the rate limit
-- Minimum interval = `max_time_window / rate_limit_per_window`
+- Minimum interval = `ceil(max_time_window / rate_limit_per_window)` (implemented as `(max_time_window + rate_limit_per_window - 1) / rate_limit_per_window`)
 - If `rate_limit_per_window > 0` and `last_executed_at > 0`, elapsed time must be ≥ min interval
 - Setting `rate_limit_per_window = 0` disables rate limiting
 

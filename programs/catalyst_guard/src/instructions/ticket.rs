@@ -262,12 +262,15 @@ pub fn handle_execute_ticket(
 
     // ── M1: Rate limiting ───────────────────────────────────────
     // Simple rate limit: enforce minimum interval between executions.
-    // min_interval = max_time_window / rate_limit_per_window
+    // min_interval = ceil(max_time_window / rate_limit_per_window)
     if policy.rate_limit_per_window > 0 && policy.last_executed_at > 0 {
+        let per_window = policy.rate_limit_per_window as i64;
         let min_interval = policy
             .max_time_window
-            .checked_div(policy.rate_limit_per_window as i64)
-            .unwrap_or(0);
+            .checked_add(per_window - 1)
+            .ok_or(CatalystError::MathOverflow)?
+            .checked_div(per_window)
+            .ok_or(CatalystError::MathOverflow)?;
         let elapsed = clock
             .unix_timestamp
             .checked_sub(policy.last_executed_at)

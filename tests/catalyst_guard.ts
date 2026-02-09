@@ -1295,6 +1295,194 @@ describe("catalyst_guard", () => {
     });
   });
 
+  // ── Rate limit tests ─────────────────────────────────────────
+
+  describe("Rate limiting (M1)", () => {
+    const rlAuthority = Keypair.generate();
+
+    let rlPolicyPDA: PublicKey;
+    let rlDriftUserPDA: PublicKey;
+    let rlDriftUserStatsPDA: PublicKey;
+
+    before(async () => {
+      const airdropSig = await provider.connection.requestAirdrop(
+        rlAuthority.publicKey,
+        5_000_000_000
+      );
+      await provider.connection.confirmTransaction(airdropSig);
+
+      [rlDriftUserPDA] = findDriftUserPDA(rlAuthority.publicKey, DRIFT_SUB_ACCOUNT_ID);
+      [rlDriftUserStatsPDA] = findDriftUserStatsPDA(rlAuthority.publicKey);
+
+      await driftStub.methods
+        .initUser(DRIFT_SUB_ACCOUNT_ID)
+        .accounts({
+          user: rlDriftUserPDA,
+          authority: rlAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([rlAuthority])
+        .rpc();
+
+      await driftStub.methods
+        .initUserStats()
+        .accounts({
+          userStats: rlDriftUserStatsPDA,
+          authority: rlAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([rlAuthority])
+        .rpc();
+
+      [rlPolicyPDA] = findPolicyPDA(
+        program.programId,
+        rlAuthority.publicKey,
+        rlDriftUserPDA
+      );
+
+      await program.methods
+        .initPolicy(
+          [0],
+          new anchor.BN(1_000_000_000),
+          100,
+          new anchor.BN(10),
+          new anchor.BN(60),
+          1,
+          false
+        )
+        .accounts({
+          policy: rlPolicyPDA,
+          authority: rlAuthority.publicKey,
+          driftSubAccount: rlDriftUserPDA,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([rlAuthority])
+        .rpc();
+
+      // Configure Drift user delegate = Policy PDA so CatalystGuard can sign CPIs.
+      await driftStub.methods
+        .updateUserDelegate(rlPolicyPDA)
+        .accounts({
+          user: rlDriftUserPDA,
+          authority: rlAuthority.publicKey,
+        })
+        .signers([rlAuthority])
+        .rpc();
+    });
+
+    it("rejects execute_ticket when rate limit interval not elapsed (RateLimitExceeded)", async () => {
+      // Ensure oracle is fresh and predicate is satisfied.
+      const slot = await provider.connection.getSlot();
+      await oracleProgram.methods
+        .setFeed(new anchor.BN(160_000_000), new anchor.BN(slot))
+        .accounts({
+          feed: oracleFeed.publicKey,
+          authority: authority.publicKey,
+        })
+        .rpc();
+
+      const payload = defaultPayload();
+      const revealData = serializePayload(payload);
+
+      // Ticket 1: execute successfully.
+      const ticketId1 = randomBytes(32);
+      const salt1 = randomBytes(32);
+      const commitment1 = createCommitment(
+        rlAuthority.publicKey,
+        rlPolicyPDA,
+        ticketId1,
+        salt1,
+        revealData
+      );
+      const now = Math.floor(Date.now() / 1000);
+      const [ticketPDA1] = findTicketPDA(program.programId, rlPolicyPDA, ticketId1);
+
+      await program.methods
+        .createTicket(
+          Array.from(commitment1) as any,
+          Array.from(ticketId1) as any,
+          new anchor.BN(now + 3600)
+        )
+        .accounts({
+          ticket: ticketPDA1,
+          policy: rlPolicyPDA,
+          owner: rlAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([rlAuthority])
+        .rpc();
+
+      await program.methods
+        .executeTicket(Array.from(salt1) as any, revealData)
+        .accounts({
+          ticket: ticketPDA1,
+          policy: rlPolicyPDA,
+          keeper: rlAuthority.publicKey,
+          oracle: oracleFeed.publicKey,
+          driftProgram: DRIFT_PROGRAM_ID,
+          driftState: driftStatePDA,
+          driftUser: rlDriftUserPDA,
+          driftUserStats: rlDriftUserStatsPDA,
+          driftSpotMarket: driftSpotMarketPDA,
+          driftPerpMarket: driftPerpMarket0PDA,
+        })
+        .signers([rlAuthority])
+        .rpc();
+
+      // Ticket 2: immediate execution should be rate-limited.
+      const ticketId2 = randomBytes(32);
+      const salt2 = randomBytes(32);
+      const commitment2 = createCommitment(
+        rlAuthority.publicKey,
+        rlPolicyPDA,
+        ticketId2,
+        salt2,
+        revealData
+      );
+      const [ticketPDA2] = findTicketPDA(program.programId, rlPolicyPDA, ticketId2);
+
+      await program.methods
+        .createTicket(
+          Array.from(commitment2) as any,
+          Array.from(ticketId2) as any,
+          new anchor.BN(now + 3600)
+        )
+        .accounts({
+          ticket: ticketPDA2,
+          policy: rlPolicyPDA,
+          owner: rlAuthority.publicKey,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([rlAuthority])
+        .rpc();
+
+      try {
+        await program.methods
+          .executeTicket(Array.from(salt2) as any, revealData)
+          .accounts({
+            ticket: ticketPDA2,
+            policy: rlPolicyPDA,
+            keeper: rlAuthority.publicKey,
+            oracle: oracleFeed.publicKey,
+            driftProgram: DRIFT_PROGRAM_ID,
+            driftState: driftStatePDA,
+            driftUser: rlDriftUserPDA,
+            driftUserStats: rlDriftUserStatsPDA,
+            driftSpotMarket: driftSpotMarketPDA,
+            driftPerpMarket: driftPerpMarket0PDA,
+          })
+          .signers([rlAuthority])
+          .rpc();
+        expect.fail("Should have thrown – rate limited");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("RateLimitExceeded");
+      }
+
+      const ticket2 = await program.account.ticket.fetch(ticketPDA2);
+      expect(ticket2.status).to.deep.equal({ open: {} });
+    });
+  });
+
   // ── M1 Adversarial: Payload validation tests ─────────────────
 
   describe("Payload validation (M1)", () => {
@@ -1538,6 +1726,19 @@ describe("catalyst_guard", () => {
       const payload = defaultPayload();
       payload.orderType = OrderType.Limit;
       payload.limitPrice = null;
+
+      try {
+        await createAndExecute(payload);
+        expect.fail("Should have thrown");
+      } catch (err: any) {
+        expect(err.toString()).to.contain("InvalidRevealData");
+      }
+    });
+
+    it("rejects Limit order with limit_price = 0 (InvalidRevealData)", async () => {
+      const payload = defaultPayload();
+      payload.orderType = OrderType.Limit;
+      payload.limitPrice = BigInt(0);
 
       try {
         await createAndExecute(payload);
