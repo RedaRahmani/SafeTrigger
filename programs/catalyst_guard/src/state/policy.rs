@@ -47,6 +47,10 @@ pub struct Policy {
     /// Whether orders must be reduce-only.
     pub reduce_only: bool,
 
+    /// Maximum allowed oracle staleness in slots.
+    /// Separated from min_time_window to avoid conflation.
+    pub max_oracle_staleness_slots: u64,
+
     /// Number of tickets created under this policy.
     pub ticket_count: u64,
 
@@ -79,6 +83,7 @@ impl Policy {
         + 8   // max_time_window
         + 2   // rate_limit_per_window
         + 1   // reduce_only
+        + 8   // max_oracle_staleness_slots
         + 8   // ticket_count
         + 8   // executed_count
         + 8   // created_at
@@ -131,6 +136,7 @@ mod tests {
             max_time_window: 3600,
             rate_limit_per_window: 10,
             reduce_only: false,
+            max_oracle_staleness_slots: 100,
             ticket_count: 0,
             executed_count: 0,
             created_at: 0,

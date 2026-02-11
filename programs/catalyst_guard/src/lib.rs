@@ -38,6 +38,7 @@ pub mod catalyst_guard {
         max_time_window: i64,
         rate_limit_per_window: u16,
         reduce_only: bool,
+        max_oracle_staleness_slots: u64,
     ) -> Result<()> {
         instructions::policy::handle_init_policy(
             ctx,
@@ -48,6 +49,7 @@ pub mod catalyst_guard {
             max_time_window,
             rate_limit_per_window,
             reduce_only,
+            max_oracle_staleness_slots,
         )
     }
 
@@ -58,6 +60,7 @@ pub mod catalyst_guard {
         max_base_amount: Option<u64>,
         oracle_deviation_bps: Option<u16>,
         reduce_only: Option<bool>,
+        max_oracle_staleness_slots: Option<u64>,
     ) -> Result<()> {
         instructions::policy::handle_update_policy(
             ctx,
@@ -65,6 +68,7 @@ pub mod catalyst_guard {
             max_base_amount,
             oracle_deviation_bps,
             reduce_only,
+            max_oracle_staleness_slots,
         )
     }
 
@@ -100,8 +104,8 @@ pub mod catalyst_guard {
     /// Invariant P2: reveal is coupled to execution.
     /// Invariant P3: replay protection via consumed flag.
     /// Invariant P4: CPI is hard-allowlisted.
-    pub fn execute_ticket(
-        ctx: Context<ExecuteTicket>,
+    pub fn execute_ticket<'info>(
+        ctx: Context<'_, '_, 'info, 'info, ExecuteTicket<'info>>,
         secret_salt: [u8; 32],
         revealed_data: Vec<u8>,
     ) -> Result<()> {

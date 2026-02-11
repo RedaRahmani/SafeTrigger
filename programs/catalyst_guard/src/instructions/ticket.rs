@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::CatalystError;
 use crate::events::{TicketCancelled, TicketCreated, TicketExecuted, TicketExpired};
-use crate::state::oracle::PriceFeed;
+use crate::state::oracle::read_oracle_price;
 use crate::state::payload::HedgePayloadV1;
 use crate::state::policy::{Policy, POLICY_SEED};
 use crate::state::ticket::*;
@@ -113,11 +113,13 @@ pub fn handle_create_ticket(
 pub struct CancelTicket<'info> {
     #[account(
         mut,
+        close = owner,
         has_one = owner @ CatalystError::NotTicketOwner,
         constraint = ticket.is_open() @ CatalystError::TicketAlreadyConsumed,
     )]
     pub ticket: Account<'info, Ticket>,
 
+    #[account(mut)]
     pub owner: Signer<'info>,
 }
 
@@ -144,12 +146,15 @@ pub fn handle_cancel_ticket(ctx: Context<CancelTicket>) -> Result<()> {
 pub struct ExpireTicket<'info> {
     #[account(
         mut,
+        close = cranker,
         constraint = ticket.is_open() @ CatalystError::TicketAlreadyConsumed,
         constraint = ticket.is_expired(Clock::get()?.unix_timestamp) @ CatalystError::TicketNotExpired,
     )]
     pub ticket: Account<'info, Ticket>,
 
     /// Permissionless: anyone can expire a ticket after its expiry time.
+    /// Rent is reclaimed to the cranker as incentive.
+    #[account(mut)]
     pub cranker: Signer<'info>,
 }
 
@@ -219,8 +224,8 @@ pub struct ExecuteTicket<'info> {
     pub drift_perp_market: UncheckedAccount<'info>,
 }
 
-pub fn handle_execute_ticket(
-    ctx: Context<ExecuteTicket>,
+pub fn handle_execute_ticket<'info>(
+    ctx: Context<'_, '_, 'info, 'info, ExecuteTicket<'info>>,
     secret_salt: [u8; 32],
     revealed_data: Vec<u8>,
 ) -> Result<()> {
@@ -290,20 +295,20 @@ pub fn handle_execute_ticket(
         CatalystError::InvalidOracleAccount
     );
 
-    let mut oracle_data: &[u8] = &ctx.accounts.oracle.try_borrow_data()?;
-    let feed = PriceFeed::try_deserialize(&mut oracle_data)
+    let oracle_data: &[u8] = &ctx.accounts.oracle.try_borrow_data()?;
+    let (oracle_price, oracle_slot) = read_oracle_price(oracle_data)
         .map_err(|_| CatalystError::InvalidOracleAccount)?;
 
-    require!(policy.min_time_window > 0, CatalystError::InvalidTimeWindow);
-    let max_staleness_slots = policy.min_time_window as u64;
+    require!(policy.max_oracle_staleness_slots > 0, CatalystError::InvalidTimeWindow);
+    let max_staleness_slots = policy.max_oracle_staleness_slots;
     let age_slots = clock
         .slot
-        .checked_sub(feed.last_updated_slot)
+        .checked_sub(oracle_slot)
         .ok_or(CatalystError::InvalidOracleAccount)?;
     require!(age_slots <= max_staleness_slots, CatalystError::OracleStale);
 
     require!(
-        payload.is_trigger_met(feed.price),
+        payload.is_trigger_met(oracle_price),
         CatalystError::PredicateNotMet
     );
 
@@ -398,9 +403,33 @@ pub fn handle_execute_ticket(
 
     // Construct Drift OrderParams (typed, deterministic, validated).
     // Only Market/Limit are supported by CatalystGuard MVP.
+    //
+    // Slippage enforcement for Market orders: compute a worst-case limit
+    // price from the oracle price and max_slippage_bps, then pass it as
+    // the `price` field. Drift uses this as a price cap/floor for market
+    // orders, protecting against sandwich attacks.
     let (order_type, price) = match payload.order_type {
         drift_cpi::instructions::OrderType::Market => {
-            (drift_cpi::instructions::OrderType::Market, 0)
+            let slippage_price = if payload.max_slippage_bps > 0 {
+                let bps = payload.max_slippage_bps as u64;
+                match payload.side {
+                    // Long: max price = oracle_price * (1 + slippage_bps / 10_000)
+                    drift_cpi::instructions::PositionDirection::Long => oracle_price
+                        .checked_mul(10_000u64.checked_add(bps).ok_or(CatalystError::MathOverflow)?)
+                        .ok_or(CatalystError::MathOverflow)?
+                        .checked_div(10_000)
+                        .ok_or(CatalystError::MathOverflow)?,
+                    // Short: min price = oracle_price * (1 - slippage_bps / 10_000)
+                    drift_cpi::instructions::PositionDirection::Short => oracle_price
+                        .checked_mul(10_000u64.checked_sub(bps).ok_or(CatalystError::SlippageExceeded)?)
+                        .ok_or(CatalystError::MathOverflow)?
+                        .checked_div(10_000)
+                        .ok_or(CatalystError::MathOverflow)?,
+                }
+            } else {
+                0 // No slippage limit = accept any fill price
+            };
+            (drift_cpi::instructions::OrderType::Market, slippage_price)
         }
         drift_cpi::instructions::OrderType::Limit => (
             drift_cpi::instructions::OrderType::Limit,
@@ -433,35 +462,68 @@ pub fn handle_execute_ticket(
     // Instruction data (discriminator hardcoded in drift_cpi crate).
     let cpi_data = build_place_perp_order_data(&order_params);
 
-    // Instruction account metas: declared accounts + explicit extra accounts in Drift's expected order:
-    // oracles, spot markets, perp markets, then any optional accounts.
+    // ── CPI account ordering ────────────────────────────────────
+    //
+    // Drift's `load_maps` processes remaining accounts via a peekable
+    // iterator in strict sequential order:
+    //   1. OracleMap::load  — consumes accounts with oracle discriminators
+    //   2. SpotMarketMap::load — consumes SpotMarket discriminator accounts
+    //   3. PerpMarketMap::load — consumes PerpMarket discriminator accounts
+    //
+    // All accounts of each type MUST be contiguous. We therefore order:
+    //   [state, user, authority,  oracle, <extra_oracles>, <extra_spots>,
+    //    spot_market_0, perp_market_0]
+    //
+    // ctx.remaining_accounts is supplied by the caller in Drift order:
+    //   extra oracles first, then extra spot markets, then extra perps.
+    // This lets Drift's MapLoaders consume all groups correctly.
+    //
+    // user_stats is NOT required by Drift's `place_perp_order` instruction
+    // (only state, user, authority are named) so we omit it from the CPI.
     let mut cpi_accounts = build_place_perp_order_accounts(
         ctx.accounts.drift_state.key(),
         ctx.accounts.drift_user.key(),
         ctx.accounts.policy.key(),
     );
+
+    // Oracle (always first in Drift remaining_accounts)
     cpi_accounts.push(
         anchor_lang::solana_program::instruction::AccountMeta::new_readonly(
             ctx.accounts.oracle.key(),
             false,
         ),
     );
+
+    // Forward caller-supplied remaining accounts (extra oracles, then extra
+    // spot markets, then extra perps — in Drift's expected order).
+    // These are NOT validated by CatalystGuard — Drift itself validates them
+    // via its MapLoader. This is safe because:
+    //   1. Drift program ID is hard-allowlisted above
+    //   2. Order params are fully constructed by CatalystGuard on-chain
+    //   3. Additional accounts only allow Drift to read more market/oracle data
+    for acct in ctx.remaining_accounts.iter() {
+        cpi_accounts.push(
+            anchor_lang::solana_program::instruction::AccountMeta {
+                pubkey: acct.key(),
+                is_signer: acct.is_signer,
+                is_writable: acct.is_writable,
+            },
+        );
+    }
+
+    // Quote spot market (USDC) — goes after extra spots so SpotMarketMap
+    // can consume all spot accounts contiguously.
     cpi_accounts.push(
         anchor_lang::solana_program::instruction::AccountMeta::new_readonly(
             ctx.accounts.drift_spot_market.key(),
             false,
         ),
     );
+
+    // Perp market — last market group.
     cpi_accounts.push(
         anchor_lang::solana_program::instruction::AccountMeta::new_readonly(
             ctx.accounts.drift_perp_market.key(),
-            false,
-        ),
-    );
-    // Optional account: user_stats is validated, and passed last so Drift's map loaders stop cleanly.
-    cpi_accounts.push(
-        anchor_lang::solana_program::instruction::AccountMeta::new_readonly(
-            ctx.accounts.drift_user_stats.key(),
             false,
         ),
     );
@@ -480,15 +542,17 @@ pub fn handle_execute_ticket(
         &[ctx.accounts.policy.bump],
     ];
 
-    let cpi_infos = [
+    let mut cpi_infos = vec![
         ctx.accounts.drift_state.to_account_info(),
         ctx.accounts.drift_user.to_account_info(),
         ctx.accounts.policy.to_account_info(), // authority (PDA delegate)
         ctx.accounts.oracle.to_account_info(),
-        ctx.accounts.drift_spot_market.to_account_info(),
-        ctx.accounts.drift_perp_market.to_account_info(),
-        ctx.accounts.drift_user_stats.to_account_info(),
     ];
+    for acct in ctx.remaining_accounts.iter() {
+        cpi_infos.push(acct.to_account_info());
+    }
+    cpi_infos.push(ctx.accounts.drift_spot_market.to_account_info());
+    cpi_infos.push(ctx.accounts.drift_perp_market.to_account_info());
 
     invoke_signed(&cpi_ix, &cpi_infos, &[policy_seeds])?;
 
@@ -513,6 +577,7 @@ pub fn handle_execute_ticket(
         payload_hash,
         market_index: payload.market_index,
         base_amount: payload.base_amount,
+        order_price: price,
         slot: clock.slot,
         timestamp: clock.unix_timestamp,
     });

@@ -39,6 +39,7 @@ pub fn handle_init_policy(
     max_time_window: i64,
     rate_limit_per_window: u16,
     reduce_only: bool,
+    max_oracle_staleness_slots: u64,
 ) -> Result<()> {
     require!(
         allowed_markets.len() <= MAX_ALLOWED_MARKETS,
@@ -80,6 +81,7 @@ pub fn handle_init_policy(
     policy.max_time_window = max_time_window;
     policy.rate_limit_per_window = rate_limit_per_window;
     policy.reduce_only = reduce_only;
+    policy.max_oracle_staleness_slots = max_oracle_staleness_slots;
     policy.ticket_count = 0;
     policy.executed_count = 0;
     policy.created_at = clock.unix_timestamp;
@@ -112,6 +114,7 @@ pub fn handle_update_policy(
     max_base_amount: Option<u64>,
     oracle_deviation_bps: Option<u16>,
     reduce_only: Option<bool>,
+    max_oracle_staleness_slots: Option<u64>,
 ) -> Result<()> {
     let policy = &mut ctx.accounts.policy;
     let clock = Clock::get()?;
@@ -135,6 +138,10 @@ pub fn handle_update_policy(
 
     if let Some(ro) = reduce_only {
         policy.reduce_only = ro;
+    }
+
+    if let Some(staleness) = max_oracle_staleness_slots {
+        policy.max_oracle_staleness_slots = staleness;
     }
 
     policy.updated_at = clock.unix_timestamp;
