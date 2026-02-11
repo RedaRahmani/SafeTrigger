@@ -1,23 +1,24 @@
-//! CatalystGuard Keeper Service – v0.3 MVP
+//! CatalystGuard Keeper Service – v0.4 Production
 //!
 //! Monitors open tickets via Solana JSON-RPC, evaluates trigger predicates
-//! against mock oracle prices, and logs which tickets are ready to execute.
+//! against oracle prices, and executes tickets when conditions are met.
 //!
 //! # Architecture
 //!
 //! 1. Poll open Ticket accounts via `getProgramAccounts` (JSON-RPC + memcmp)
-//! 2. Deserialize HedgePayloadV1 from off-chain database (when available)
-//! 3. Evaluate trigger conditions against oracle prices
+//! 2. Deserialize HedgePayloadV1 from off-chain secrets store
+//! 3. Evaluate trigger conditions against oracle prices (TestOracle + PythLazer)
 //! 4. Submit `execute_ticket` via JSON-RPC `sendTransaction`
+//! 5. Expose `/healthz` and `/metrics` HTTP endpoints (axum)
+//! 6. Graceful shutdown via SIGINT/SIGTERM
 //!
 //! # Running
 //!
 //! ```bash
-//! # Start localnet first: solana-test-validator
-//! # Then:
 //! RUST_LOG=info cargo run -p keeper
 //! ```
 
+use axum::{extract::State as AxumState, response::IntoResponse, routing::get, Router};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use borsh::{BorshDeserialize, BorshSerialize};
 use serde::{Deserialize, Serialize};
@@ -29,7 +30,16 @@ use solana_sdk::{
     signature::{read_keypair_file, Keypair, Signature, Signer},
     transaction::Transaction,
 };
-use std::{collections::HashMap, path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    str::FromStr,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tracing::{error, info, warn};
 
 // ── Constants ───────────────────────────────────────────────────
@@ -51,6 +61,78 @@ const TICKET_DATA_LEN: u64 = 178;
 /// 8 (discriminator) + 32 (owner) + 32 (policy) + 32 (commitment) + 32 (ticket_id) + 1 (bump) = 137
 const STATUS_OFFSET: usize = 137;
 
+/// PythLazerOracle discriminator (sha256("account:PythLazerOracle")[0..8]).
+const PYTH_LAZER_DISC: [u8; 8] = [0x9f, 0x07, 0xa1, 0xf9, 0x22, 0x51, 0x79, 0x85];
+
+/// Total on-chain PythLazerOracle account size.
+const PYTH_LAZER_ACCOUNT_LEN: usize = 48;
+
+/// Default HTTP port for health/metrics endpoints.
+const DEFAULT_HTTP_PORT: u16 = 9090;
+
+// ── Metrics ─────────────────────────────────────────────────────
+
+/// Keeper operational metrics exposed via `/metrics`.
+#[derive(Debug)]
+struct Metrics {
+    polls_total: AtomicU64,
+    tickets_found_total: AtomicU64,
+    executions_attempted: AtomicU64,
+    executions_succeeded: AtomicU64,
+    executions_failed: AtomicU64,
+    polls_failed: AtomicU64,
+    last_poll_epoch_secs: AtomicU64,
+    healthy: AtomicBool,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        Self {
+            polls_total: AtomicU64::new(0),
+            tickets_found_total: AtomicU64::new(0),
+            executions_attempted: AtomicU64::new(0),
+            executions_succeeded: AtomicU64::new(0),
+            executions_failed: AtomicU64::new(0),
+            polls_failed: AtomicU64::new(0),
+            last_poll_epoch_secs: AtomicU64::new(0),
+            healthy: AtomicBool::new(true),
+        }
+    }
+
+    fn to_prometheus(&self) -> String {
+        format!(
+            "# HELP keeper_polls_total Total number of poll iterations\n\
+             # TYPE keeper_polls_total counter\n\
+             keeper_polls_total {}\n\
+             # HELP keeper_tickets_found_total Total tickets discovered across all polls\n\
+             # TYPE keeper_tickets_found_total counter\n\
+             keeper_tickets_found_total {}\n\
+             # HELP keeper_executions_attempted Total execution attempts\n\
+             # TYPE keeper_executions_attempted counter\n\
+             keeper_executions_attempted {}\n\
+             # HELP keeper_executions_succeeded Total successful executions\n\
+             # TYPE keeper_executions_succeeded counter\n\
+             keeper_executions_succeeded {}\n\
+             # HELP keeper_executions_failed Total failed executions\n\
+             # TYPE keeper_executions_failed counter\n\
+             keeper_executions_failed {}\n\
+             # HELP keeper_polls_failed Total poll failures\n\
+             # TYPE keeper_polls_failed counter\n\
+             keeper_polls_failed {}\n\
+             # HELP keeper_last_poll_epoch_secs Epoch timestamp of last successful poll\n\
+             # TYPE keeper_last_poll_epoch_secs gauge\n\
+             keeper_last_poll_epoch_secs {}\n",
+            self.polls_total.load(Ordering::Relaxed),
+            self.tickets_found_total.load(Ordering::Relaxed),
+            self.executions_attempted.load(Ordering::Relaxed),
+            self.executions_succeeded.load(Ordering::Relaxed),
+            self.executions_failed.load(Ordering::Relaxed),
+            self.polls_failed.load(Ordering::Relaxed),
+            self.last_poll_epoch_secs.load(Ordering::Relaxed),
+        )
+    }
+}
+
 // ── Configuration ───────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +149,8 @@ pub struct KeeperConfig {
     pub max_execute_retries: u32,
     /// Base backoff (ms) between retries.
     pub retry_backoff_ms: u64,
+    /// HTTP port for /healthz and /metrics endpoints.
+    pub http_port: u16,
     pub mock_oracle_prices: Vec<MockOraclePrice>,
 }
 
@@ -95,6 +179,7 @@ impl Default for KeeperConfig {
             dry_run: false,
             max_execute_retries: 3,
             retry_backoff_ms: 500,
+            http_port: DEFAULT_HTTP_PORT,
             mock_oracle_prices: vec![
                 MockOraclePrice {
                     market_index: 0,
@@ -258,6 +343,57 @@ fn parse_test_oracle_feed(data: &[u8]) -> Result<(u64, u64), String> {
     Ok((price, last_updated_slot))
 }
 
+/// Parse a PythLazerOracle account (48 bytes: 8 disc + 40 data).
+/// Returns (price_in_1e6, posted_slot).
+fn parse_pyth_lazer_oracle(data: &[u8]) -> Result<(u64, u64), String> {
+    if data.len() < PYTH_LAZER_ACCOUNT_LEN {
+        return Err(format!(
+            "pyth lazer too short: {} < {}",
+            data.len(),
+            PYTH_LAZER_ACCOUNT_LEN
+        ));
+    }
+    if data[0..8] != PYTH_LAZER_DISC {
+        return Err("pyth lazer discriminator mismatch".to_string());
+    }
+    let raw_price = i64::from_le_bytes(data[8..16].try_into().unwrap());
+    let posted_slot = u64::from_le_bytes(data[24..32].try_into().unwrap());
+    let exponent = i32::from_le_bytes(data[32..36].try_into().unwrap());
+
+    if raw_price <= 0 {
+        return Err("pyth lazer negative price".to_string());
+    }
+    let price_abs = raw_price as u64;
+
+    // Normalise to 1e6
+    let scale = 6i32
+        .checked_add(exponent)
+        .ok_or("pyth exponent overflow")?;
+    let price_1e6 = if scale >= 0 {
+        let mult = 10u64
+            .checked_pow(scale as u32)
+            .ok_or("pyth scale overflow")?;
+        price_abs.checked_mul(mult).ok_or("pyth price overflow")?
+    } else {
+        let div = 10u64
+            .checked_pow((-scale) as u32)
+            .ok_or("pyth scale overflow")?;
+        price_abs / div
+    };
+
+    Ok((price_1e6, posted_slot))
+}
+
+/// Attempt to parse oracle data as either PythLazer or TestOracle format.
+fn parse_oracle_auto(data: &[u8]) -> Result<(u64, u64), String> {
+    // Try PythLazer first (discriminator match)
+    if data.len() >= PYTH_LAZER_ACCOUNT_LEN && data[0..8] == PYTH_LAZER_DISC {
+        return parse_pyth_lazer_oracle(data);
+    }
+    // Fallback: TestOracle
+    parse_test_oracle_feed(data)
+}
+
 // ── Ticket account parsing ──────────────────────────────────────
 
 #[derive(Debug)]
@@ -325,6 +461,7 @@ pub struct PolicyAccount {
     pub max_time_window: i64,
     pub rate_limit_per_window: u16,
     pub reduce_only: bool,
+    pub max_oracle_staleness_slots: u64,
     pub ticket_count: u64,
     pub executed_count: u64,
     pub created_at: i64,
@@ -656,6 +793,26 @@ async fn execute_ticket_with_retries(
     Err("exhausted retries".to_string())
 }
 
+// ── HTTP Endpoints ──────────────────────────────────────────────
+
+async fn healthz_handler(AxumState(metrics): AxumState<Arc<Metrics>>) -> impl IntoResponse {
+    if metrics.healthy.load(Ordering::Relaxed) {
+        (axum::http::StatusCode::OK, "ok\n")
+    } else {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "unhealthy\n")
+    }
+}
+
+async fn metrics_handler(AxumState(metrics): AxumState<Arc<Metrics>>) -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
+        metrics.to_prometheus(),
+    )
+}
+
 // ── Main ────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -667,24 +824,21 @@ async fn main() {
         )
         .init();
 
-    info!("CatalystGuard Keeper v0.3 MVP starting...");
+    info!("CatalystGuard Keeper v0.4 Production starting...");
 
     let config = load_config();
     info!(
-        "RPC={}, poll={}s, oracles={}",
+        "RPC={}, poll={}s, http_port={}, oracles={}",
         config.rpc_url,
         config.poll_interval_secs,
+        config.http_port,
         config.mock_oracle_prices.len()
     );
 
     let client = reqwest::Client::new();
-    let rpc = Rpc {
-        client: &client,
-        rpc_url: &config.rpc_url,
-    };
 
     // Verify RPC connectivity
-    match check_rpc(rpc.client, rpc.rpc_url).await {
+    match check_rpc(&client, &config.rpc_url).await {
         Ok(version) => info!("Connected to Solana: {}", version),
         Err(e) => {
             error!("RPC connection failed: {}", e);
@@ -692,10 +846,64 @@ async fn main() {
         }
     }
 
+    // ── Metrics & HTTP server ───────────────────────────────────
+    let metrics = Arc::new(Metrics::new());
+    let shutdown_flag = Arc::new(AtomicBool::new(false));
+
+    let app = Router::new()
+        .route("/healthz", get(healthz_handler))
+        .route("/metrics", get(metrics_handler))
+        .with_state(metrics.clone());
+
+    let http_addr = format!("0.0.0.0:{}", config.http_port);
+    let listener = match tokio::net::TcpListener::bind(&http_addr).await {
+        Ok(l) => {
+            info!("HTTP server listening on {}", http_addr);
+            l
+        }
+        Err(e) => {
+            error!("Failed to bind HTTP on {}: {}", http_addr, e);
+            std::process::exit(1);
+        }
+    };
+
+    let http_handle = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("HTTP server crashed");
+    });
+
+    // ── Graceful shutdown listener ──────────────────────────────
+    let shutdown = shutdown_flag.clone();
+    tokio::spawn(async move {
+        let ctrl_c = tokio::signal::ctrl_c();
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("register SIGTERM");
+            tokio::select! {
+                _ = ctrl_c => info!("Received SIGINT, shutting down..."),
+                _ = sigterm.recv() => info!("Received SIGTERM, shutting down..."),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            ctrl_c.await.expect("ctrl-c signal");
+            info!("Received SIGINT, shutting down...");
+        }
+        shutdown.store(true, Ordering::Relaxed);
+    });
+
     info!("Monitoring program: {}", PROGRAM_ID);
 
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
     let mut iteration = 0u64;
+
+    // Execution dedup: track recently attempted tickets to avoid double-submits.
+    let mut recently_executed: HashSet<String> = HashSet::new();
+    // Clear dedup set every N iterations to allow retries on genuinely stuck tickets.
+    const DEDUP_CLEAR_INTERVAL: u64 = 60;
 
     let keeper = match load_keypair(&config.keypair_path) {
         Ok(k) => k,
@@ -712,9 +920,26 @@ async fn main() {
     let program_id = Pubkey::from_str(PROGRAM_ID).expect("PROGRAM_ID is valid");
     let test_oracle_program_id =
         Pubkey::from_str(TEST_ORACLE_PROGRAM_ID).expect("TEST_ORACLE_PROGRAM_ID is valid");
+    let drift_program_id = drift_cpi::DRIFT_PROGRAM_ID;
 
-    loop {
+    let rpc = Rpc {
+        client: &client,
+        rpc_url: &config.rpc_url,
+    };
+
+    while !shutdown_flag.load(Ordering::Relaxed) {
         iteration += 1;
+        metrics.polls_total.fetch_add(1, Ordering::Relaxed);
+
+        // Clear dedup set periodically
+        if iteration % DEDUP_CLEAR_INTERVAL == 0 {
+            let cleared = recently_executed.len();
+            recently_executed.clear();
+            if cleared > 0 {
+                info!("Cleared {} entries from dedup set", cleared);
+            }
+        }
+
         info!("── Poll #{} ──", iteration);
 
         let secrets = load_secrets(&config.secrets_path);
@@ -729,8 +954,24 @@ async fn main() {
         match get_program_accounts(&client, &config.rpc_url).await {
             Ok(tickets) => {
                 info!("Found {} open ticket(s)", tickets.len());
+                metrics
+                    .tickets_found_total
+                    .fetch_add(tickets.len() as u64, Ordering::Relaxed);
+                let now_epoch = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                metrics.last_poll_epoch_secs.store(now_epoch, Ordering::Relaxed);
+                metrics.healthy.store(true, Ordering::Relaxed);
+
                 for (pubkey, data) in &tickets {
                     let short = pubkey.get(0..8).unwrap_or(pubkey);
+
+                    // Dedup: skip tickets recently attempted
+                    if recently_executed.contains(pubkey) {
+                        continue;
+                    }
+
                     let ticket_pubkey = match Pubkey::from_str(pubkey) {
                         Ok(pk) => pk,
                         Err(e) => {
@@ -865,18 +1106,20 @@ async fn main() {
                     let oracle_program = Pubkey::new_from_array(payload.oracle_program);
                     let oracle_pubkey = Pubkey::new_from_array(payload.oracle);
 
-                    // Off-chain predicate precheck.
-                    let oracle_price = if oracle_program == test_oracle_program_id {
+                    // Off-chain predicate precheck with oracle.
+                    let oracle_price = if oracle_program == test_oracle_program_id
+                        || oracle_program == drift_program_id
+                    {
                         match get_account_data(&client, &config.rpc_url, &oracle_pubkey.to_string())
                             .await
                         {
-                            Ok(oracle_data) => match parse_test_oracle_feed(&oracle_data) {
+                            Ok(oracle_data) => match parse_oracle_auto(&oracle_data) {
                                 Ok((price, last_slot)) => {
-                                    if current_slot > 0 && policy.min_time_window > 0 {
+                                    let max_staleness = policy.max_oracle_staleness_slots;
+                                    if current_slot > 0 && max_staleness > 0 {
                                         let age = current_slot.saturating_sub(last_slot);
-                                        let max_age = policy.min_time_window as u64;
-                                        if age > max_age {
-                                            info!("  Ticket {} oracle stale (skipping)", short);
+                                        if age > max_staleness {
+                                            info!("  Ticket {} oracle stale (age={} > max={})", short, age, max_staleness);
                                             continue;
                                         }
                                     }
@@ -936,16 +1179,36 @@ async fn main() {
                     };
 
                     match execute_ticket_with_retries(&rpc, &config, &keeper, ix).await {
-                        Ok(sig) => info!("  Ticket {} executed: {}", short, sig),
-                        Err(e) => warn!("  Ticket {} execute failed: {}", short, e),
+                        Ok(sig) => {
+                            info!("  Ticket {} executed: {}", short, sig);
+                            metrics.executions_succeeded.fetch_add(1, Ordering::Relaxed);
+                            recently_executed.insert(pubkey.clone());
+                        }
+                        Err(e) => {
+                            warn!("  Ticket {} execute failed: {}", short, e);
+                            metrics.executions_failed.fetch_add(1, Ordering::Relaxed);
+                            recently_executed.insert(pubkey.clone());
+                        }
                     }
+                    metrics.executions_attempted.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            Err(e) => warn!("Poll failed: {}", e),
+            Err(e) => {
+                warn!("Poll failed: {}", e);
+                metrics.polls_failed.fetch_add(1, Ordering::Relaxed);
+                // Mark unhealthy after consecutive poll failures
+                if metrics.polls_failed.load(Ordering::Relaxed) > 5 {
+                    metrics.healthy.store(false, Ordering::Relaxed);
+                }
+            }
         }
 
         tokio::time::sleep(poll_interval).await;
     }
+
+    info!("Keeper shutting down gracefully...");
+    http_handle.abort();
+    info!("Goodbye.");
 }
 
 fn expand_tilde(path: &str) -> PathBuf {
@@ -1107,6 +1370,68 @@ mod tests {
     fn test_default_config() {
         let c = KeeperConfig::default();
         assert_eq!(c.rpc_url, "http://localhost:8899");
+        assert_eq!(c.http_port, DEFAULT_HTTP_PORT);
         assert!(!c.mock_oracle_prices.is_empty());
+    }
+
+    #[test]
+    fn test_pyth_lazer_parse() {
+        // Construct a minimal 48-byte PythLazerOracle account
+        let mut data = vec![0u8; 48];
+        data[0..8].copy_from_slice(&PYTH_LAZER_DISC);
+        // price = 15000000000 (i64, $150 at exp=-8 → $150 at 1e6 = 150_000_000)
+        let raw_price: i64 = 15_000_000_000;
+        data[8..16].copy_from_slice(&raw_price.to_le_bytes());
+        // publish_time at 16..24 (skip)
+        // posted_slot = 12345 at 24..32
+        data[24..32].copy_from_slice(&12345u64.to_le_bytes());
+        // exponent = -8 at 32..36
+        data[32..36].copy_from_slice(&(-8i32).to_le_bytes());
+
+        let (price, slot) = parse_pyth_lazer_oracle(&data).unwrap();
+        assert_eq!(slot, 12345);
+        // 15_000_000_000 * 10^(6 + (-8)) = 15_000_000_000 / 100 = 150_000_000
+        assert_eq!(price, 150_000_000);
+    }
+
+    #[test]
+    fn test_oracle_auto_detect() {
+        // PythLazer: should detect by discriminator
+        let mut pyth_data = vec![0u8; 48];
+        pyth_data[0..8].copy_from_slice(&PYTH_LAZER_DISC);
+        let raw_price: i64 = 10_000_000_000;
+        pyth_data[8..16].copy_from_slice(&raw_price.to_le_bytes());
+        pyth_data[24..32].copy_from_slice(&999u64.to_le_bytes());
+        pyth_data[32..36].copy_from_slice(&(-8i32).to_le_bytes());
+
+        let (price, slot) = parse_oracle_auto(&pyth_data).unwrap();
+        assert_eq!(slot, 999);
+        assert_eq!(price, 100_000_000); // $100
+
+        // TestOracle: different discriminator, should fallback to raw parser
+        let mut test_data = vec![0u8; 56];
+        // Arbitrary discriminator (not PythLazer)
+        test_data[0..8].copy_from_slice(&[0xAA; 8]);
+        // authority = 32 bytes at offset 8
+        // price = 200_000_000 at offset 40
+        test_data[40..48].copy_from_slice(&200_000_000u64.to_le_bytes());
+        // last_updated_slot = 500 at offset 48
+        test_data[48..56].copy_from_slice(&500u64.to_le_bytes());
+
+        // parse_oracle_auto will try PythLazer first (disc mismatch),
+        // then fall back to parse_test_oracle_feed (raw byte parser).
+        let (price2, slot2) = parse_oracle_auto(&test_data).unwrap();
+        assert_eq!(price2, 200_000_000);
+        assert_eq!(slot2, 500);
+    }
+
+    #[test]
+    fn test_metrics_prometheus_format() {
+        let m = Metrics::new();
+        m.polls_total.store(10, Ordering::Relaxed);
+        m.executions_succeeded.store(3, Ordering::Relaxed);
+        let output = m.to_prometheus();
+        assert!(output.contains("keeper_polls_total 10"));
+        assert!(output.contains("keeper_executions_succeeded 3"));
     }
 }

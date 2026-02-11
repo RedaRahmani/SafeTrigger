@@ -1,11 +1,14 @@
-# CatalystGuard Keeper (v0.3 MVP)
+# CatalystGuard Keeper (v0.4 Production)
 
 Off-chain service that:
 
 - Scans on-chain `Ticket` accounts in `Open` status via Solana JSON-RPC `getProgramAccounts`.
 - Looks up the corresponding off-chain secrets (`secret_salt`, `HedgePayloadV1` bytes) from a local `secrets.json`.
-- Evaluates the trigger predicate against an oracle (localnet `test_oracle`) or configured mock prices.
+- Evaluates the trigger predicate against an oracle (localnet `test_oracle`, devnet/mainnet `PythLazerOracle`) or configured mock prices.
 - Submits an `execute_ticket` transaction via JSON-RPC `sendTransaction` (with retries + backoff).
+- Exposes `/healthz` and `/metrics` (Prometheus format) HTTP endpoints.
+- Handles graceful shutdown via SIGINT/SIGTERM.
+- Deduplicates recent execution attempts to avoid double-submits.
 
 ## Config
 
@@ -23,6 +26,7 @@ Example `keeper.config.json`:
   "dry_run": false,
   "max_execute_retries": 3,
   "retry_backoff_ms": 500,
+  "http_port": 9090,
   "mock_oracle_prices": [
     { "market_index": 0, "price": 160000000 }
   ]
@@ -34,6 +38,15 @@ Run:
 ```bash
 KEEPER_CONFIG=keeper.config.json RUST_LOG=info cargo run -p keeper --release
 ```
+
+## HTTP Endpoints
+
+| Endpoint   | Description                             |
+|------------|-----------------------------------------|
+| `/healthz` | Returns `200 ok` or `503 unhealthy`     |
+| `/metrics` | Prometheus-format counters and gauges   |
+
+Default port: `9090` (configurable via `http_port`).
 
 ## Secrets File
 
@@ -56,9 +69,9 @@ Notes:
 
 ## Oracle Support
 
-- If the ticket payload specifies `oracle_program == programs/test_oracle` (used in the Anchor tests),
-  the keeper will parse the oracle feed account data to pre-filter tickets and enforce staleness checks.
-- Otherwise, the keeper falls back to `mock_oracle_prices` from config (best-effort only).
+- **PythLazerOracle** (devnet/mainnet): Auto-detected by discriminator (`9f07a1f922517985`). Parses `price`, `posted_slot`, `exponent` and normalizes to 1e6 precision.
+- **TestOracle** (localnet): Raw byte parsing for the `test_oracle` program's `PriceFeed` account.
+- **Mock prices**: Fallback from `mock_oracle_prices` in config.
 
 The on-chain program is the source of truth; keeper-side checks are prefilters and do not weaken
 on-chain enforcement.
