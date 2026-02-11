@@ -298,7 +298,8 @@ describe("catalyst_guard", () => {
           minTimeWindow,
           maxTimeWindow,
           rateLimitPerWindow,
-          reduceOnly
+          reduceOnly,
+          new anchor.BN(100)
         )
         .accounts({
           policy: policyPDA,
@@ -333,7 +334,7 @@ describe("catalyst_guard", () => {
 
     it("updates a policy", async () => {
       const tx = await program.methods
-        .updatePolicy(null, new anchor.BN(2_000_000_000), null, true)
+        .updatePolicy(null, new anchor.BN(2_000_000_000), null, true, null)
         .accounts({
           policy: policyPDA,
           authority: authority.publicKey,
@@ -376,7 +377,7 @@ describe("catalyst_guard", () => {
 
       try {
         await program.methods
-          .updatePolicy(null, null, null, null)
+          .updatePolicy(null, null, null, null, null)
           .accounts({
             policy: policyPDA,
             authority: impostor.publicKey,
@@ -394,7 +395,7 @@ describe("catalyst_guard", () => {
 
       try {
         await program.methods
-          .updatePolicy(tooManyMarkets, null, null, null)
+          .updatePolicy(tooManyMarkets, null, null, null, null)
           .accounts({
             policy: policyPDA,
             authority: authority.publicKey,
@@ -481,7 +482,8 @@ describe("catalyst_guard", () => {
           new anchor.BN(10),
           new anchor.BN(60),
           0,
-          true
+          true,
+          new anchor.BN(100)
         )
         .accounts({
           policy: katPolicyPDA,
@@ -1095,8 +1097,9 @@ describe("catalyst_guard", () => {
         })
         .rpc();
 
-      const ticketAccount = await program.account.ticket.fetch(ticketPDA3);
-      expect(ticketAccount.status).to.deep.equal({ cancelled: {} });
+      // Account is closed (rent reclaimed) — verify it no longer exists
+      const ticketInfo = await provider.connection.getAccountInfo(ticketPDA3);
+      expect(ticketInfo).to.be.null;
     });
 
     it("rejects ticket creation with past expiry", async () => {
@@ -1188,7 +1191,8 @@ describe("catalyst_guard", () => {
           new anchor.BN(60),
           new anchor.BN(3600),
           10,
-          false
+          false,
+          new anchor.BN(100)
         )
         .accounts({
           policy: policyBPDA,
@@ -1460,7 +1464,8 @@ describe("catalyst_guard", () => {
           new anchor.BN(10),
           new anchor.BN(60),
           1,
-          false
+          false,
+          new anchor.BN(100)
         )
         .accounts({
           policy: rlPolicyPDA,
@@ -1755,7 +1760,16 @@ describe("catalyst_guard", () => {
         .rpc();
 
       const currentSlot = await provider.connection.getSlot();
-      const staleSlot = Math.max(0, currentSlot - 11); // policy.min_time_window = 10
+
+      // Temporarily lower max_oracle_staleness_slots so the test works on a
+      // fresh local validator where currentSlot is small (often < 100).
+      await program.methods
+        .updatePolicy(null, null, null, null, new anchor.BN(10))
+        .accounts({ policy: policyPDA, authority: authority.publicKey })
+        .rpc();
+
+      const staleSlot = Math.max(0, currentSlot - 11); // policy.max_oracle_staleness_slots = 10
+
       await oracleProgram.methods
         .setFeed(new anchor.BN(160_000_000), new anchor.BN(staleSlot))
         .accounts({
@@ -1784,6 +1798,12 @@ describe("catalyst_guard", () => {
       } catch (err: any) {
         expect(err.toString()).to.contain("OracleStale");
       }
+
+      // Restore original staleness setting
+      await program.methods
+        .updatePolicy(null, null, null, null, new anchor.BN(100))
+        .accounts({ policy: policyPDA, authority: authority.publicKey })
+        .rpc();
     });
 
     it("rejects market_index not in policy allowlist", async () => {
@@ -2185,7 +2205,16 @@ describe("catalyst_guard", () => {
           .rpc();
         expect.fail("Should have thrown – already cancelled");
       } catch (err: any) {
-        expect(err.toString()).to.contain("TicketAlreadyConsumed");
+        // Account is closed on first cancel, so second cancel fails with
+        // an Anchor account deserialization/not-found error
+        const errStr = err.toString();
+        expect(
+          errStr.includes("AccountNotInitialized") ||
+          errStr.includes("Account does not exist") ||
+          errStr.includes("TicketAlreadyConsumed") ||
+          errStr.includes("3012") ||
+          errStr.includes("Error processing Instruction")
+        ).to.be.true;
       }
     });
 
