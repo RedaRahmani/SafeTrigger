@@ -98,6 +98,9 @@ pub enum CatalystError {
     #[msg("Rate limit exceeded for this policy window")]
     RateLimitExceeded,
 
+    #[msg("Slippage tolerance exceeded")]
+    SlippageExceeded,
+
     // ── Access control ──────────────────────────────────────────
     #[msg("Unauthorized: signer is not the authority")]
     Unauthorized,

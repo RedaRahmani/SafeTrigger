@@ -37,6 +37,8 @@ pub struct TicketExecuted {
     pub market_index: u16,
     /// Base asset amount from the revealed payload.
     pub base_amount: u64,
+    /// Price used in the order (slippage-adjusted for Market, limit_price for Limit).
+    pub order_price: u64,
     /// Slot at execution.
     pub slot: u64,
     /// Unix timestamp at execution.
